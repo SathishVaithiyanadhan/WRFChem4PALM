@@ -1,0 +1,163 @@
+!------------------------------------------------------------------------------
+!-- INITIALIZATION PARAMETER NAMELIST
+!-- Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/inipar
+!------------------------------------------------------------------------------
+ &initialization_parameters
+!
+!-- grid parameters
+!------------------------------------------------------------------------------
+    nx                         = 359,
+    ny                         = 359,
+    nz                         = 200,
+
+    dx                         = 10.0,
+    dy                         = 10.0,
+    dz                         = 10.0,
+    dz_max                     = 30.0,
+    dz_stretch_level           = 1200.0,
+    dz_stretch_factor          = 1.02,
+    
+    topography                 = 'read_from_file',
+   
+    approximation = 'boussinesq',
+    random_heatflux = .F.,
+    constant_flux_layer = .T.,
+    scalar_advec   = 'ws-scheme',
+    momentum_advec = 'ws-scheme',
+    omega = 0.0,
+    rayleigh_damping_factor = 0.01,
+    rayleigh_damping_height = 2900.0,
+
+
+
+    psolver = 'multigrid',
+    fft_method = 'fftw',
+
+    initializing_actions = 'inifor set_constant_profiles',
+    humidity   = .T.,
+
+
+!
+!-- geophysical setup
+!------------------------------------------------------------------------------
+   
+!    day_of_year_init = 34,
+!    time_utc_init    = 82800.0,
+
+    latitude                   = -43.487,
+    longitude                  = 172.547,
+    origin_date_time = '2017-02-13 02:00:00 +00',
+
+
+
+    rayleigh_damping_height    = 344.0,
+    rayleigh_damping_factor    = 0.01,
+
+ /  ! end of initialization_parameters namelist
+
+!-------------------------------------------------------------------------------
+!-- RUNTIME PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/d3par
+!-------------------------------------------------------------------------------
+ &runtime_parameters
+    end_time                  =    21600.0,
+    termination_time_needed   =      900.0,
+    create_disturbances = .T.,
+    disturbance_energy_limit = 0.01,
+    dt_disturb = 150.0,
+    dt_run_control            =    10.0,
+    averaging_interval        =    10.0,
+
+    skip_time_dopr            =      0.0,
+    dt_max                    =      1.0,
+    dt_data_output            =     10.0,
+    dt_data_output_av         =    60.0,
+    dt_do3d                   =     10.0,
+    dt_do2d_xy                =     10.0,
+    dt_do2d_xz                =     10.0,
+    dt_do2d_yz                =     10.0,
+    dt_dots                   =     10.0,
+    dt_run_control            =    60.0,
+    dt_dopr                   =     10.0,
+    averaging_interval_pr     =    0.0,
+    dt_averaging_input_pr     =    0.0,
+         !skip_time_do3d            =    10800.0,
+
+    netcdf_data_format        =    4,
+    netcdf_deflate            =    0,
+    npex = 20,
+    npey = 20,    
+    section_xy = 0,1,2,5, 10,
+    section_xz = 180,
+         !section_yz = 40,48,64,80,100,
+
+    data_output_pr = '#u', 'w"u"', 'w*u*', 'wu', 'u*2',
+                     '#v', 'w"v"', 'w*v*', 'wv', 'v*2',
+                     'w', 'w*2', 'e', 'e*', '#km', '#l','#kh','#theta','hyp','p','rho',
+
+    data_output = 'u', 'v', 'w', 'theta','p', 'e',
+                 'z0*_xy', 'z0h*_xy', 'tsurf*_xy', 'theta_2m*_xy','wspeed', 'wspeed_10m*_xy',
+ 
+
+
+/  ! end of runtime_parameters namelist
+
+
+!-------------------------------------------------------------------------------
+!-- RADIATION PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/radpar
+!-------------------------------------------------------------------------------
+&radiation_parameters
+    radiation_scheme           = 'clear-sky',
+    plant_lw_interact          = .F.,
+    raytrace_discrete_azims    = 10,
+    raytrace_discrete_elevs    = 10,
+    dt_radiation               = 3600.0,
+
+
+/ ! end of radiation parameter namelist
+
+&land_surface_parameters
+
+    soil_moisture =  0.18352804, 0.18352804, 0.18352804, 0.183911, 0.1869747,
+                      0.19142141, 0.19797706, 0.23697187, 
+    soil_temperature =  296.5668869 , 296.5668869 , 296.5668869 , 296.3213401 ,
+                        294.35696555, 291.63102998, 290.93325411, 289.27697754,
+    deep_soil_temperature = 285.82938,       ! approx. from dynamic driver at z=-3m
+
+
+
+/ ! end of land surface parameter namelist
+!------------------------------------------------------------------------------
+!-- URBAN SURFACE MODEL PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/usmpar
+!------------------------------------------------------------------------------
+&urban_surface_parameters
+
+    usm_material_model = .T.,
+ / ! end of urban_surface_parameters namelist
+!------------------------------------------------------------------------------
+!-- PLANT CANOPY MODEL PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/canpar
+!------------------------------------------------------------------------------
+&plant_canopy_parameters
+    canopy_mode = 'read_from_file',
+    canopy_drag_coeff = 0.15,
+ / ! end of plant_canopy_parameters namelist
+
+!-- SYNTHETIC TURBULENCE GENERATOR PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/stg_par
+!---------------------------------------------------------------------------------------
+&stg_par
+    use_syn_turb_gen = .T.,
+    dt_stg_adjust    = 30.0,
+    dt_stg_call      = 1.0,
+ / ! end of stg_par namelist
+
+!---------------------------------------------------------------------------------------
+!-- OFFLINE NESTING PARAMETER NAMELIST
+!   Documentation: https://palm.muk.uni-hannover.de/trac/wiki/doc/app/nestofflpar
+!---------------------------------------------------------------------------------------
+&nesting_offl_parameters
+    nesting_offline = .T.,
+ / ! end of nesting_offl_parameters namelist

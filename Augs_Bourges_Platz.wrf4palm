@@ -1,0 +1,59 @@
+[case]
+case_name = "Augs_Bourges_Platz",
+max_pool = 4,
+geostrophic = "", ## calculate geostrophic wind using the variable pressure (option "p") or geopotential height  (option "z")
+
+[domain]
+palm_proj = "EPSG:25832",    # projection of PALM
+centlat = 48.36587, 
+centlon = 10.89428,
+#nx                         = 400,
+#ny                         = 400,
+#nz                         = 200,
+#dx                         = 10.0,
+#dy                         = 10.0,
+#dz                         = 10.0,
+nx        = 61,                                  # number of grid points along x-axis
+ny        = 61,                                  # number of grid points along y-axis
+nz        = 100,                                  # number of grid points along z-axis
+dx        = 10.0,                                 # number of grid points along x-axis
+dy        = 10.0,                                 # number of grid points along y-axis
+dz        = 10.0,                                 # number of grid points along z-axis
+z_origin  = 500.0,                                 # elevated mean grid position (elevated terrain)
+
+
+[stretch]
+dz_stretch_factor = 1.06,        # stretch factor for a vertically stretched grid
+                                # set this to 1.0 if no streching required
+dz_stretch_level = 200.0,      # Height level above which the grid is to be stretched vertically (in m)
+
+dz_max = 10.0,                  # allowed maximum vertical grid spacing (in m)
+
+
+[wrf]
+wrf_path = "./wrf_output/",
+wrf_output = "wrfout_d02_2025-02-*",
+
+interp_mode = "linear",
+
+start_year = 2025,
+start_month = 2,
+start_day = 3,
+start_hour = 00,
+
+end_year = 2025,
+end_month = 2,
+end_day = 3,
+end_hour = 23,
+
+dynamic_ts = 3600.0,         # PALM dynamic driver update frequency
+
+[soil]
+# layers for soil temperature and moisture calculation
+# this shall be changed depending on different cases
+
+dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
+msoil = 0.3, # dummy value in case soil moisture from WRF output is 0.0
+
+[chemistry] 
+species = ["PM10", "PM2_5_DRY"], # chemical species to include from WRF-Chem - "no", "no2", "o3", "PM10", "PM2_5_DRY"
