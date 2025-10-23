@@ -1,18 +1,7 @@
-# WRF4PALM v1.1  [![DOI](https://zenodo.org/badge/258736274.svg)](https://zenodo.org/badge/latestdoi/258736274)
+# WRFChem4PALM 
 
 
-*If you wish to use WRF4PALM v1.0, please go to [WRF4PALM v1.0](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.0)*
-
-**Want to create your own static driver? Check out [GEO4PALM](https://github.com/dongqi-DQ/GEO4PALM)!**
-
-## Contents
-1. [What's new?](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1/#whats-new-in-v11)
-2. [Instructions](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1/#instrustions)
-3. [Quick comparison script](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1/#quick-compare-wrf--palm)
-
-## What's new in v1.1.2?
-1. Users now have option to calculate geostropihc wind using geopotential height (option `"z"`) or pressure (option `"p"`) via `geostrophic` option in `[case]`.  
-2. The surface NaN solver now is taking surface variables from the correct altitude by including terrain height in WRF.
+Its the extension tool of WRF4PALM. The tool WRFChem4PALM handles Meteorology, Chemistry and Aerosols. 
 
 ## What's new in v1.1?
 - multiple WRF output files are allowed
@@ -25,23 +14,18 @@
 - allow users to specify the projection of PALM simulation
 - geostrophic winds are estimated using geopotential height instead of pressure
 
-## Instrustions
-**How to use WRF4PALM v1.1**
-1. Download the entire source code to local
-2. Provide your own WRF output
-3. Edit [namelist](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#namelist)
-4. [Run WRF4PALM](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#one-line-command)
-
 
 ### namelist
 In v1.1, users don't have to edit the main script, and only need to edit the namelist file to provide their input (for examples please see `namelist.wrf4palm`).
 
-There are 5 sections in the namelist:
+There are 6 sections in the namelist:
 - [case](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#case): users to provide case name and multiprocessing information
 - [domain](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#domain): PALM domain configuration
 - [stretch](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#stretch): if a vertically streched grid is used
 - [wrf](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#wrf): information about WRF output and start/end time in the dynamic driver
 - [soil](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#soil): soil layers and dummy soil moisture information
+- [chemistry]: List of chemistry species required in the dynamic file
+
 
 #### case
 In the `case` section, users need to provide their case name and the maximum number of CPUs they want to use in WRF4PALM (here the number is 4).
@@ -124,55 +108,105 @@ dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
 msoil = 0.3,         # dummy value in case soil moisture from WRF output is 0.0
 ```
 
+#### Chemistry
+In the `chemistry` section, users need to config the initial and the boundary conditions for the species 
+
+```
+[chemistry] 
+species = ["PM10", "PM2_5_DRY"], # chemical species to include from WRF-Chem - "no", "no2", "o3", "PM10", "PM2_5_DRY"
+
+```
+
 ### One line command
 Once the namelist is ready, users can run WRF4PALM using the one line command:
 ```
 python run_config_wrf4palm.py [your namelist]
+Eg. python run_config_wrf4palm.py  Augs_Bourges_Platz.wrf4palm
 ```
 
 **Execution example**
 ```
+(wrf4palm) vaithisa@med-nb-0190:~/WRF4PALM_v1.1.2$  python run_config_wrf4palm.py  Augs_Bourges_Platz.wrf4palm
+Raw chemistry species: (['PM10', 'PM2_5_DRY'],), type: <class 'tuple'>
+Final chemistry species: ['PM10', 'PM2_5_DRY']
 Reading WRF
-cfg file is saved: wrf4palm_test
+cfg file is saved: Augs_Bourges_Platz
 Start horizontal interpolation
 Calculating soil temperature and moisture from WRF
-100%|█████████████████████████████████████████████████████████████████| 200/200 [00:29<00:00,  6.74it/s]
+100%|█████████████████████████████████████████████████████████████████████████| 61/61 [00:01<00:00, 59.56it/s]
 Start vertical interpolation
+create empty datasets
+create empty datasets for staggered U and V (west&east boundaries)
+create empty datasets for staggered U and V (south&north boundaries)
+remove unused vars from datasets
+load dataset for west&east boundaries
+load dataset for south&north boundaries
+load dataset for west&east boundaries (staggered U)
+load dataset for south&north boundaries (staggered U)
+load dataset for west&east boundaries (staggered V)
+load dataset for south&north boundaries (staggered V)
+create datasets to save data in PALM coordinates
+create zeros arrays for vertical interpolation
 Processing QVAPOR for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:23<00:00,  5.13it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 24.41it/s]
 Processing QVAPOR for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:23<00:00,  5.14it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 22.58it/s]
 Processing pt for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:25<00:00,  4.68it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.83it/s]
 Processing pt for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:25<00:00,  4.73it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.94it/s]
+Processing chemistry species: ['PM10', 'PM2_5_DRY']
+Checking if PM10 exists in dataset...
+Processing PM10...
+Processing PM10 for west and east boundaries
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 26.15it/s]
+Processing PM10 for south and north boundaries
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.42it/s]
+Checking if PM2_5_DRY exists in dataset...
+Processing PM2_5_DRY...
+Processing PM2_5_DRY for west and east boundaries
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.51it/s]
+Processing PM2_5_DRY for south and north boundaries
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.38it/s]
 Processing W for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████| 119/119 [00:23<00:00,  5.00it/s]
+100%|█████████████████████████████████████████████████████████████████████████| 99/99 [00:04<00:00, 24.21it/s]
 Processing W for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████| 119/119 [00:23<00:00,  5.08it/s]
+100%|█████████████████████████████████████████████████████████████████████████| 99/99 [00:04<00:00, 21.75it/s]
 Processing U for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:22<00:00,  5.26it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 24.76it/s]
 Processing U for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:23<00:00,  5.19it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 21.35it/s]
 Processing V for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:23<00:00,  5.19it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 23.78it/s]
 Processing V for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████| 120/120 [00:23<00:00,  5.20it/s]
+100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.83it/s]
+Handling NaN values in chemistry boundary conditions...
+Checking for NaN values in PM10 boundary conditions...
+Found NaN values for PM10 in boundaries
+Filling remaining NaNs for PM10 in west/east with nearest values
+Completed NaN handling for PM10
+Checking for NaN values in PM2_5_DRY boundary conditions...
+Found NaN values for PM2_5_DRY in boundaries
+Filling remaining NaNs for PM2_5_DRY in west/east with nearest values
+Completed NaN handling for PM2_5_DRY
 Processing top boundary conditions...
-100%|█████████████████████████████████████████████████████████████████████| 5/5 [01:08<00:00, 13.70s/it]
+Processing top boundary datasets...
+100%|████████████████████████████████████████████████████████████████████████| 24/24 [00:00<00:00, 478.40it/s]
 Geostrophic wind estimation...
-100%|███████████████████████████████████████████████████████████████████| 22/22 [00:02<00:00,  8.80it/s]
+Warning: geostr_lvl '' not recognized. Creating empty geostrophic wind dataset.
 Resolving surface NaNs...
-100%|█████████████████████████████████████████████████████████████████████| 5/5 [01:05<00:00, 13.14s/it]
+100%|███████████████████████████████████████████████████████████████████████████| 5/5 [00:09<00:00,  2.00s/it]
+Resolving surface NaNs...
+100%|███████████████████████████████████████████████████████████████████████████| 5/5 [00:09<00:00,  1.96s/it]
 Writing NetCDF file
 Add to your *_p3d file:
- soil_temperature = [288.09888275146477, 288.42630248766665, 289.2634380215685, 289.9926226307226, 292.3663809474804, 293.1886674499512, 293.1886674499512, 293.1886674499512]
- soil_moisture = [0.29, 0.29, 0.29, 0.29, 0.29, 0.29, 0.29, 0.29]
- deep_soil_temperature = 294.6415
+ soil_temperature = [275.1575803897265, 275.1575803897265, 275.1575803897265, 275.1575803897265, 275.59096211727683, 276.4171930245544, 277.2602839338403, 277.3071223549133]
+ soil_moisture = [0.29050817773450777, 0.29050817773450777, 0.29050817773450777, 0.29050817773450777, 0.29221371136792584, 0.295842009108187, 0.30285884381862155, 0.3032486682790056]
+ deep_soil_temperature = 281.09296
 
-PALM dynamic input file is ready. Script duration: 0:07:26.348010
-Start time: 2020-12-25T13:00:00.000000000
-End time: 2020-12-26T10:00:00.000000000
+PALM dynamic input file is ready. Script duration: 0:02:16.649943
+Start time: 2025-02-03T00:00:00.000000000
+End time: 2025-02-03T23:00:00.000000000
 Time step: 3600.0 seconds
 ```
 
@@ -234,13 +268,11 @@ Note that the time series are horizontally averaged and hence the comparison onl
 ### End of README
 --------------------------------------------------------------------------------------------
 
-Development of WRF4PALM is based on WRF2PALM (https://github.com/ricardo88faria/WRF2PALM).
+Development of WRFChem4PALM is based on WRF4PALM (https://github.com/dongqi-DQ/WRF4PALM).
 
 A full documentation is still under construction, if you have any queries please contact the author or open a new issue.
 
 --------------------------------------------------------------------------------------------
-**Contact: Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)**
+**Contact: Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)
+Sathish Kumar Vaithiyanadhan (sathish.vaithiyanadhan@med.uni-augsburg.de) -- Chemistry and aerosol part**
 
-**How to cite**
-
-Lin, D., Khan, B., Katurji, M., Bird, L., Faria, R., and Revell, L. E.: WRF4PALM v1.0: a mesoscale dynamical driver for the microscale PALM model system 6.0, Geosci. Model Dev., 14, 2503–2524, https://doi.org/10.5194/gmd-14-2503-2021, 2021.
