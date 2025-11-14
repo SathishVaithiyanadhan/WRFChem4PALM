@@ -56,4 +56,4 @@ dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
 msoil = 0.3, # dummy value in case soil moisture from WRF output is 0.0
 
 [chemistry] 
-species = ["PM10", "PM2_5_DRY"], # chemical species to include from WRF-Chem - "no", "no2", "o3", "PM10", "PM2_5_DRY"
+species = ["no", "no2", "o3", "PM10", "PM2_5_DRY"], # chemical species to include from WRF-Chem - "no", "no2", "o3", "PM10", "PM2_5_DRY"
