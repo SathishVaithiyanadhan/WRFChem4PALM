@@ -1208,10 +1208,10 @@ nc_output['surface_forcing_surface_pressure'] = xr.DataArray(surface_pres.data, 
          attrs={'units':'Pa', 'lod':np.int32(1), 'source':'WRF', 'res_origin':res_origin})
 
 
-nc_output['ls_forcing_ug'] = xr.DataArray(ds_geostr["ug"].data,dims=['time','z'],
+'''nc_output['ls_forcing_ug'] = xr.DataArray(ds_geostr["ug"].data,dims=['time','z'],
          attrs={'units':'m/s', 'long_name':'u wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
 nc_output['ls_forcing_vg'] = xr.DataArray(ds_geostr["vg"].data,dims=['time','z'],
-         attrs={'units':'m/s', 'long_name':'v wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
+         attrs={'units':'m/s', 'long_name':'v wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})'''
 
 # Add chemistry species to output
 # Conversion factor from microgram/m3 to kg/m3
