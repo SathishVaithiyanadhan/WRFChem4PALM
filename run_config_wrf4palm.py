@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 import os
 import time
@@ -48,7 +49,7 @@ geostr_lvl =  ast.literal_eval(config.get("case", "geostrophic" ))[0]
 chem_species_raw = ast.literal_eval(config.get("chemistry", "species"))
 print(f"Raw chemistry species: {chem_species_raw}, type: {type(chem_species_raw)}")
 
-# FIX: Properly handle chemistry species list
+# chemistry species list
 if isinstance(chem_species_raw, tuple):
     # Handle case where it's a tuple containing a list
     if len(chem_species_raw) == 1 and isinstance(chem_species_raw[0], list):
@@ -62,6 +63,57 @@ else:
     chem_species = [chem_species_raw]
 
 print(f"Final chemistry species: {chem_species}")
+
+# Read radiation settings from config
+try:
+    radiation_from_wrf = ast.literal_eval(config.get("radiation", "radiation_from_wrf"))[0]
+except:
+    radiation_from_wrf = True  # Default to True if not specified
+    print("Radiation setting not found in config, defaulting to True")
+
+try:
+    radiation_smoothing_distance = ast.literal_eval(config.get("radiation", "radiation_smoothing_distance"))[0]
+except:
+    radiation_smoothing_distance = 10000.0  # Default value if not specified
+    print("Radiation smoothing distance not found in config, defaulting to 10000.0 m")
+
+print(f"Radiation from WRF: {radiation_from_wrf}")
+print(f"Radiation smoothing distance: {radiation_smoothing_distance} m")
+
+# Define component species for aggregated species (needed for processing)
+RH_components = ["isopr", "apin", "bpin", "limon", "bcary", "myrc", 
+                "benzene", "tol", "xylenes", "bigalk", "bigene", 
+                "c2h4", "c2h2", "c3h6"]
+
+RO2_components = ["ch3o2", "aco3", "mco3", "alko2", "aceto2", "benzo2", 
+                 "eto2", "pro2", "po2", "xo2", "terpo2", "terp2o2", 
+                 "nterpo2", "isopao2", "isopbo2", "mdialo2", "dicarbo2"]
+
+RCHO_components = ["ald", "bzald", "glyald", "hydrald", "gly", "mgly", "hcho"]
+
+OCSV_components = ["cvasoaX", "cvasoa1", "cvasoa2", "cvasoa3", "cvasoa4", 
+                  "cvbsoaX", "cvbsoa1", "cvbsoa2", "cvbsoa3", "cvbsoa4"]
+
+# Create a list of all component species needed for aggregation
+all_component_species = []
+if "RH" in chem_species:
+    all_component_species.extend(RH_components)
+if "RO2" in chem_species:
+    all_component_species.extend(RO2_components)
+if "RCHO" in chem_species:
+    all_component_species.extend(RCHO_components)
+if "OCSV" in chem_species:
+    all_component_species.extend(OCSV_components)
+
+# Remove duplicates
+all_component_species = list(set(all_component_species))
+
+# Combine regular chemistry species with component species for processing
+all_chem_to_process = list(set(chem_species + all_component_species))
+# added later
+all_chem_to_process = [s for s in all_chem_to_process if s not in ["RH", "RO2", "RCHO", "OCSV"]]
+
+print(f"All chemistry species to process: {all_chem_to_process}")
 
 palm_proj_code = ast.literal_eval(config.get("domain", "palm_proj"))[0]
 centlat = ast.literal_eval(config.get("domain", "centlat"))[0]
@@ -180,6 +232,7 @@ time_step_sec = ((dt_end-dt_start)).total_seconds()
 times_sec = np.zeros(len(all_ts))
 for t in range(0,len(all_ts)):
     times_sec[t] = (all_ts[t]-all_ts[0]).astype('float')*1e-9
+
 #-------------------------------------------------------------------------------
 # Locate PALM domain in WRF
 #-------------------------------------------------------------------------------
@@ -247,7 +300,6 @@ generate_cfg(case_name, dx, dy, dz, nx, ny, nz,
 west_idx,east_idx,south_idx,north_idx = framing_2d_cartesian(lons_wrf,lats_wrf, west,east,south,north,dx_wrf, dy_wrf)
 
 # in case negative longitudes are used
-# these two lines may be redundant need further tests 27 Oct 2021
 if east_idx-west_idx<0:
     east_idx, west_idx = west_idx, east_idx
 
@@ -375,18 +427,18 @@ ds_sn_ustag = ds_interp_u.isel(south_north=[0,-1])
 ds_sn_vstag = ds_interp_v.isel(south_north=[0,-1])
 
 varbc_list = ["W", "QVAPOR","pt","Z"]
-# Add chemistry species to variable list
-varbc_list.extend(chem_species)
+# Add ALL chemistry species to variable list (including components)
+varbc_list.extend(all_chem_to_process)
 
 print("remove unused vars from datasets")
 for var in ds_we.data_vars:
     if var not in varbc_list:
         ds_we = ds_we.drop(var)
         ds_sn = ds_sn.drop(var)
-    if var not in ["U", "Z"] and var not in chem_species:
+    if var not in ["U", "Z"] and var not in all_chem_to_process:
         ds_we_ustag = ds_we_ustag.drop(var)
         ds_sn_ustag = ds_sn_ustag.drop(var)
-    if var not in ["V", "Z"] and var not in chem_species:
+    if var not in ["V", "Z"] and var not in all_chem_to_process:
         ds_we_vstag = ds_we_vstag.drop(var)
         ds_sn_vstag = ds_sn_vstag.drop(var)
 
@@ -425,28 +477,88 @@ for varbc in ["QVAPOR","pt"]:
     print(f"Processing {varbc} for south and north boundaries")
     ds_palm_sn[varbc] = multi_zinterp(max_pool, ds_sn, varbc, z, ds_palm_sn)
 
-# interpolation for chemistry species
-print(f"Processing chemistry species: {chem_species}")
-for species in chem_species:
-    print(f"Checking if {species} exists in dataset...")
-    if species in list(ds_we.data_vars.keys()):
+# Vertical interpolation for chemistry species
+print(f"Processing ALL chemistry species: {all_chem_to_process}")
+
+# Pre-filter to only available species
+available_chem_species = [s for s in all_chem_to_process if s in list(ds_we.data_vars.keys())]
+print(f"Available chemistry species for processing: {available_chem_species}")
+
+# Process chemistry species in batches for better performance
+def process_chemistry_batch(species_batch, ds_we, ds_sn, z, max_pool, ds_palm_we, ds_palm_sn):
+    """Process a batch of chemistry species"""
+    for species in species_batch:
         print(f"Processing {species}...")
-        # Get the actual dimensions from the WRF data
         chem_dims = ds_we[species].shape
         chem_zeros_we = np.zeros((chem_dims[0], len(z), len(y), len(x[:2])))
         chem_zeros_sn = np.zeros((chem_dims[0], len(z), len(y[:2]), len(x)))
         
         ds_palm_we[species] = xr.DataArray(np.copy(chem_zeros_we), dims=['time','z','y', 'x'])
         ds_palm_sn[species] = xr.DataArray(np.copy(chem_zeros_sn), dims=['time','z','y', 'x'])
-        print(f"Processing {species} for west and east boundaries")
-        # Use the same interpolation method as other variables
+        
+        # Process boundaries in parallel if possible
         ds_palm_we[species] = multi_zinterp(max_pool, ds_we, species, z, ds_palm_we)
-        print(f"Processing {species} for south and north boundaries")
         ds_palm_sn[species] = multi_zinterp(max_pool, ds_sn, species, z, ds_palm_sn)
-    else:
-        print(f"Warning: {species} not found in WRF dataset, skipping...")
-        print(f"Available variables: {list(ds_we.data_vars.keys())[:10]}...")  # Show first 10 variables
+
+# Process in batches for better memory management
+batch_size = 10  # Adjust based on available memory
+for i in range(0, len(available_chem_species), batch_size):
+    batch = available_chem_species[i:i + batch_size]
+    process_chemistry_batch(batch, ds_we, ds_sn, z, max_pool, ds_palm_we, ds_palm_sn)
+
+#-------------------------------------------------------------------------------
+# Calculate aggregated species from interpolated components
+#-------------------------------------------------------------------------------
+print("Calculating aggregated species from interpolated components...")
+
+def calculate_aggregated_from_interpolated(ds_palm_we, ds_palm_sn, species_name, component_list):
+    """Calculate aggregated species from interpolated component data"""
+    aggregated_we = None
+    aggregated_sn = None
+    available_components = []
     
+    for component in component_list:
+        if component in ds_palm_we.data_vars:
+            available_components.append(component)
+            if aggregated_we is None:
+                aggregated_we = ds_palm_we[component].copy()
+                aggregated_sn = ds_palm_sn[component].copy()
+            else:
+                aggregated_we = aggregated_we + ds_palm_we[component]
+                aggregated_sn = aggregated_sn + ds_palm_sn[component]
+    
+    if aggregated_we is None:
+        print(f"Warning: No components found for {species_name}")
+        # Create zeros array with correct dimensions
+        aggregated_we = xr.zeros_like(ds_palm_we[list(ds_palm_we.data_vars.keys())[0]])
+        aggregated_sn = xr.zeros_like(ds_palm_sn[list(ds_palm_sn.data_vars.keys())[0]])
+    else:
+        print(f"Calculated {species_name} from {len(available_components)} interpolated components: {available_components}")
+    
+    return aggregated_we, aggregated_sn
+
+# Calculate aggregated species and add to palm datasets
+if "RH" in chem_species:
+    print("Calculating RH from interpolated components...")
+    ds_palm_we["RH"], ds_palm_sn["RH"] = calculate_aggregated_from_interpolated(
+        ds_palm_we, ds_palm_sn, "RH", RH_components)
+
+if "RO2" in chem_species:
+    print("Calculating RO2 from interpolated components...")
+    ds_palm_we["RO2"], ds_palm_sn["RO2"] = calculate_aggregated_from_interpolated(
+        ds_palm_we, ds_palm_sn, "RO2", RO2_components)
+
+if "RCHO" in chem_species:
+    print("Calculating RCHO from interpolated components...")
+    ds_palm_we["RCHO"], ds_palm_sn["RCHO"] = calculate_aggregated_from_interpolated(
+        ds_palm_we, ds_palm_sn, "RCHO", RCHO_components)
+
+if "OCSV" in chem_species:
+    print("Calculating OCSV from interpolated components...")
+    ds_palm_we["OCSV"], ds_palm_sn["OCSV"] = calculate_aggregated_from_interpolated(
+        ds_palm_we, ds_palm_sn, "OCSV", OCSV_components)
+
+
 # interpolate w
 zeros_we_w = np.zeros((len(all_ts), len(zw), len(y), len(x[:2])))
 zeros_sn_w = np.zeros((len(all_ts), len(zw), len(y[:2]), len(x)))
@@ -483,6 +595,7 @@ ds_palm_sn["V"] = multi_zinterp(max_pool, ds_sn_vstag, "V", z, ds_palm_sn)
 # Handle NaN values in chemistry boundary conditions
 #-------------------------------------------------------------------------------
 print("Handling NaN values in chemistry boundary conditions...")
+# Now use the original chem_species list for NaN handling (includes aggregated species)
 for species in chem_species:
     if species in ds_palm_we.data_vars:
         print(f"Checking for NaN values in {species} boundary conditions...")
@@ -558,47 +671,92 @@ w_top = np.zeros((len(all_ts), len(y), len(x)))
 qv_top = np.zeros((len(all_ts), len(y), len(x)))
 pt_top = np.zeros((len(all_ts), len(y), len(x)))
 
-# Initialize arrays for chemistry species top boundary
+# Initialize arrays for chemistry species top boundary - ONLY for species that exist
 chem_top = {}
-for species in chem_species:
+# First, identify which species actually exist in the dataset
+available_top_species = [s for s in all_chem_to_process if s in ds_interp.data_vars]
+print(f"Available species for top boundary: {available_top_species}")
+
+# Initialize arrays only for available species - use the unstaggered grid dimensions (y, x)
+for species in available_top_species:
     chem_top[species] = np.zeros((len(all_ts), len(y), len(x)))
 
-for var in ds_interp.data_vars:
-    if var not in varbc_list:
+# Use all_chem_to_process for dropping variables (includes components but not aggregated)
+for var in list(ds_interp.data_vars):  # Create a list to avoid modification during iteration
+    if var not in varbc_list and var not in all_chem_to_process:
         ds_interp = ds_interp.drop(var)
-    if var not in ["U", "Z"] and var not in chem_species:
+for var in list(ds_interp_u.data_vars):
+    if var not in ["U", "Z"] and var not in all_chem_to_process:
         ds_interp_u = ds_interp_u.drop(var)
-    if var not in ["V", "Z"] and var not in chem_species:
+for var in list(ds_interp_v.data_vars):
+    if var not in ["V", "Z"] and var not in all_chem_to_process:
         ds_interp_v = ds_interp_v.drop(var)
 
 print("Processing top boundary datasets...")
 ds_interp_top = xr.Dataset()
 ds_interp_u_top = xr.Dataset()
 ds_interp_v_top = xr.Dataset()
-for var in ["QVAPOR", "pt"]:
-    ds_interp_top[var] =  ds_interp.salem.wrf_zlevel(var, levels=z[-1]).copy()
 
-# Process chemistry species for top boundary
-for species in chem_species:
-    if species in ds_interp.data_vars:
-        ds_interp_top[species] = ds_interp.salem.wrf_zlevel(species, levels=z[-1]).copy()
+# Process basic variables
+for var in ["QVAPOR", "pt"]:
+    ds_interp_top[var] = ds_interp.salem.wrf_zlevel(var, levels=z[-1]).copy()
+
+# Process chemistry species for top boundary - ONLY available species
+for species in available_top_species:
+    ds_interp_top[species] = ds_interp.salem.wrf_zlevel(species, levels=z[-1]).copy()
 
 ds_interp_top["W"] = ds_interp.salem.wrf_zlevel("W", levels=zw[-1]).copy()        
 ds_interp_u_top["U"] = ds_interp_u.salem.wrf_zlevel("U", levels=z[-1]).copy()
 ds_interp_v_top["V"] = ds_interp_v.salem.wrf_zlevel("V", levels=z[-1]).copy()
 
+# Process each timestamp individually with tqdm
+print("Processing top boundary data for all timestamps...")
 for ts in tqdm(range(0,len(all_ts)), total=len(all_ts), position=0, leave=True):
     u_top[ts,:,:] = ds_interp_u_top["U"].isel(time=ts)
     v_top[ts,:,:] = ds_interp_v_top["V"].isel(time=ts)
     w_top[ts,:,:] = ds_interp_top["W"].isel(time=ts)  
     pt_top[ts,:,:] = ds_interp_top["pt"].isel(time=ts) 
     qv_top[ts,:,:] = ds_interp_top["QVAPOR"].isel(time=ts) 
-    # Process chemistry species top boundary
-    for species in chem_species:
-        if species in ds_interp_top.data_vars:
-            chem_top[species][ts,:,:] = ds_interp_top[species].isel(time=ts)
+    
+    # Process individual chemistry species top boundary - only for available species
+    for species in available_top_species:
+        chem_top[species][ts,:,:] = ds_interp_top[species].isel(time=ts)
 
-# Handle NaN values in top boundary chemistry data
+# Calculate aggregated species for top boundary using the same timestamp-by-timestamp approach
+if "RH" in chem_species:
+    print("Calculating RH for top boundary...")
+    chem_top["RH"] = np.zeros((len(all_ts), len(y), len(x)))
+    for ts in range(len(all_ts)):
+        for comp in RH_components:
+            if comp in chem_top:
+                chem_top["RH"][ts, :, :] += chem_top[comp][ts, :, :]
+
+if "RO2" in chem_species:
+    print("Calculating RO2 for top boundary...")
+    chem_top["RO2"] = np.zeros((len(all_ts), len(y), len(x)))
+    for ts in range(len(all_ts)):
+        for comp in RO2_components:
+            if comp in chem_top:
+                chem_top["RO2"][ts, :, :] += chem_top[comp][ts, :, :]
+
+if "RCHO" in chem_species:
+    print("Calculating RCHO for top boundary...")
+    chem_top["RCHO"] = np.zeros((len(all_ts), len(y), len(x)))
+    for ts in range(len(all_ts)):
+        for comp in RCHO_components:
+            if comp in chem_top:
+                chem_top["RCHO"][ts, :, :] += chem_top[comp][ts, :, :]
+
+if "OCSV" in chem_species:
+    print("Calculating OCSV for top boundary...")
+    chem_top["OCSV"] = np.zeros((len(all_ts), len(y), len(x)))
+    for ts in range(len(all_ts)):
+        for comp in OCSV_components:
+            if comp in chem_top:
+                chem_top["OCSV"][ts, :, :] += chem_top[comp][ts, :, :]
+
+# Handle NaN values in top boundary chemistry data using the same approach
+print("Handling NaN values in top boundary...")
 for species in chem_species:
     if species in chem_top:
         if np.any(np.isnan(chem_top[species])):
@@ -612,7 +770,7 @@ for species in chem_species:
                     chem_top[species][ts, nan_mask] = mean_profile[ts]
 
 #-------------------------------------------------------------------------------
-# Geostrophic wind estimation - CORRECTED CODE
+# Geostrophic wind estimation
 #-------------------------------------------------------------------------------
 print("Geostrophic wind estimation...")
 ## Check which levels should be used for geostrophic winds calculation
@@ -698,28 +856,6 @@ else:
     print("Warning: ds_geostr not defined, skipping geostrophic wind surface NaN processing")
 
 #-------------------------------------------------------------------------------
-# surface NaNs
-#-------------------------------------------------------------------------------
-print("Resolving surface NaNs...")
-# apply multiprocessing
-with Pool(max_pool) as p:
-    pool_outputs = list(
-        tqdm(
-            p.imap(partial(solve_surface,all_ts, ds_palm_we, ds_palm_sn, surface_var_dict),surface_var_dict.keys()),
-            total=len(surface_var_dict.keys()),position=0, leave=True
-        )
-    )
-p.join()
-pool_dict = dict(pool_outputs)
-for var in surface_var_dict.keys():
-    ds_palm_we[var]= pool_dict[var][0]
-    ds_palm_sn[var]= pool_dict[var][1]
-# near surface geostrophic wind
-for t in range(0,len(all_ts)):
-    ds_geostr["ug"][t,:] =  surface_nan_w(ds_geostr["ug"][t,:].data)
-    ds_geostr["vg"][t,:] =  surface_nan_w(ds_geostr["vg"][t,:].data)
-
-#-------------------------------------------------------------------------------
 # calculate initial profiles
 #-------------------------------------------------------------------------------
 ds_drop["bottom_top"] = ds_drop["Z"].mean(("time", "south_north", "west_east")).data
@@ -752,19 +888,214 @@ qv_init = surface_nan_s(qv_init.load().data, z, qv2_wrf.sel(time=dt_start).mean(
 pt_init = surface_nan_s(pt_init.load().data, z, pt2_wrf.sel(time=dt_start).mean(
                         dim=["south_north", "west_east"]).data)
 
-# Initialize chemistry species profiles
+# Initialize chemistry species profiles 
 chem_init = {}
-for species in chem_species:
+# First process individual species 
+for species in all_chem_to_process:
     if species in ds_drop.data_vars:
-        chem_init[species] = ds_drop[species].sel(time=dt_start).mean(
+        # Load the data to convert from Dask to NumPy array
+        chem_data = ds_drop[species].sel(time=dt_start).mean(
             dim=["south_north", "west_east"]).interp(
-            {"bottom_top": z}, method = interp_mode)
+            {"bottom_top": z}, method = interp_mode).load().data
+        chem_init[species] = xr.DataArray(chem_data, dims=['z'], coords={'z': z})
     else:
         # If species not found, create zeros array
         chem_init[species] = xr.DataArray(np.zeros(len(z)), dims=['z'], coords={'z': z})
 
+# Calculate aggregated species initial profiles
+if "RH" in chem_species:
+    rh_init = np.zeros(len(z))
+    for comp in RH_components:
+        if comp in chem_init:
+            # Use .values instead of .data to get NumPy array
+            rh_init += chem_init[comp].values
+    chem_init["RH"] = xr.DataArray(rh_init, dims=['z'], coords={'z': z})
+
+if "RO2" in chem_species:
+    ro2_init = np.zeros(len(z))
+    for comp in RO2_components:
+        if comp in chem_init:
+            ro2_init += chem_init[comp].values
+    chem_init["RO2"] = xr.DataArray(ro2_init, dims=['z'], coords={'z': z})
+
+if "RCHO" in chem_species:
+    rcho_init = np.zeros(len(z))
+    for comp in RCHO_components:
+        if comp in chem_init:
+            rcho_init += chem_init[comp].values
+    chem_init["RCHO"] = xr.DataArray(rcho_init, dims=['z'], coords={'z': z})
+
+if "OCSV" in chem_species:
+    ocsv_init = np.zeros(len(z))
+    for comp in OCSV_components:
+        if comp in chem_init:
+            ocsv_init += chem_init[comp].values
+    chem_init["OCSV"] = xr.DataArray(ocsv_init, dims=['z'], coords={'z': z})
+
 surface_pres = psfc_wrf[:, :,:].mean(dim=["south_north", "west_east"]).load()
 
+#-------------------------------------------------------------------------------
+# Process radiation data from WRF
+#-------------------------------------------------------------------------------
+if radiation_from_wrf:
+    print("Processing radiation data from WRF...")
+    
+    # Get radiation variables from WRF
+    radiation_vars_exist = all(var in ds_wrf.variables for var in ['SWDOWN', 'GLW', 'SWDDIF'])
+    
+    if radiation_vars_exist:
+        print("Found radiation variables in WRF output (SWDOWN, GLW, SWDDIF)")
+        
+        # Get all available times from radiation data
+        rad_times = all_ts
+        rad_times_sec = times_sec
+        
+        # Build list of indices for radiation smoothing (similar to palm_dynamic.py)
+        print('Building list of indices for radiation smoothing...')
+        
+        # Create list of (i,j) indices within smoothing distance of domain center
+        rad_indices = []
+        xcent = centx  # domain center in projected coordinates
+        ycent = centy
+        
+        print(f"Domain center in projected coordinates: ({xcent:.2f}, {ycent:.2f})")
+        
+        # Get dimensions of WRF grid
+        nx_wrf_full = ds_wrf.dims['west_east']
+        ny_wrf_full = ds_wrf.dims['south_north']
+        
+        # Convert WRF grid coordinates to projected coordinates and find indices within smoothing distance
+        if map_proj == 6:
+            # For lat/lon projection
+            lons = ds_wrf.XLONG.isel(time=0).values
+            lats = ds_wrf.XLAT.isel(time=0).values
+            
+            for i in range(nx_wrf_full):
+                for j in range(ny_wrf_full):
+                    lonij = lons[j, i]
+                    latij = lats[j, i]
+                    xij, yij = trans_wrf2palm.transform(lonij, latij)
+                    if abs(xij - xcent) <= radiation_smoothing_distance and \
+                       abs(yij - ycent) <= radiation_smoothing_distance:
+                        rad_indices.append([i, j])
+        else:
+            # For projected WRF grid
+            # Create 2D grids of WRF coordinates
+            X, Y = np.meshgrid(np.arange(nx_wrf_full) * dx_wrf + x0_wrf,
+                              np.arange(ny_wrf_full) * dy_wrf + y0_wrf)
+            
+            # Find indices within smoothing distance
+            distance_mask = (np.abs(X - xcent) <= radiation_smoothing_distance) & \
+                           (np.abs(Y - ycent) <= radiation_smoothing_distance)
+            
+            # Get indices where mask is True
+            j_indices, i_indices = np.where(distance_mask)
+            rad_indices = [[i, j] for i, j in zip(i_indices, j_indices)]
+        
+        ngrids = len(rad_indices)
+        print(f"Found {ngrids} WRF grid cells within {radiation_smoothing_distance}m of domain center for radiation smoothing")
+        
+        # If no grid cells found, use the 3x3 grid around the center
+        if ngrids == 0:
+            print("Warning: No grid cells found within smoothing distance. Using 3x3 grid around domain center.")
+            
+            # Find the nearest grid cell indices to domain center
+            if map_proj == 6:
+                # For lat/lon projection, find nearest grid point
+                lons = ds_wrf.XLONG.isel(time=0).values
+                lats = ds_wrf.XLAT.isel(time=0).values
+                
+                # Convert center to lat/lon
+                trans_palm2wgs = Transformer.from_proj(palm_proj, wgs_proj, always_xy=True)
+                cent_lon, cent_lat = trans_palm2wgs.transform(xcent, ycent)
+                
+                # Find nearest grid indices
+                distances = np.sqrt((lons - cent_lon)**2 + (lats - cent_lat)**2)
+                j_center, i_center = np.unravel_index(np.argmin(distances), distances.shape)
+            else:
+                # For projected grid, find nearest grid point
+                distances = np.sqrt((X - xcent)**2 + (Y - ycent)**2)
+                j_center, i_center = np.unravel_index(np.argmin(distances), distances.shape)
+            
+            print(f"Nearest grid cell at indices: i={i_center}, j={j_center}")
+            
+            # Use 3x3 grid around the center (if within bounds)
+            i_min = max(0, i_center - 1)
+            i_max = min(nx_wrf_full - 1, i_center + 1)
+            j_min = max(0, j_center - 1)
+            j_max = min(ny_wrf_full - 1, j_center + 1)
+            
+            rad_indices = []
+            for i in range(i_min, i_max + 1):
+                for j in range(j_min, j_max + 1):
+                    rad_indices.append([i, j])
+            
+            ngrids = len(rad_indices)
+            print(f"Using {ngrids} grid cells in a {i_max-i_min+1}x{j_max-j_min+1} grid around the center")
+        
+        # Process radiation data for each timestamp - using proper WRF-Chem time handling
+        print("Processing radiation data for all timestamps...")
+        
+        rad_swdown = []
+        rad_lwdown = []
+        rad_swdiff = []
+        
+        # Get all WRF times as datetime objects for proper comparison
+        wrf_times = ds_wrf.time.values
+        
+        for ts in tqdm(range(len(all_ts)), desc="Radiation processing", position=0, leave=True):
+            current_time = all_ts[ts]
+            
+            # Find the closest WRF time index
+            time_diffs = np.abs(wrf_times - current_time)
+            closest_idx = np.argmin(time_diffs)
+            time_diff_seconds = time_diffs[closest_idx].astype('timedelta64[s]').astype(float)
+            
+            if time_diff_seconds > 3600:  # More than 1 hour difference
+                print(f"Warning: Large time difference ({time_diff_seconds/3600:.1f} hours) at timestamp {ts}")
+            
+            # Get radiation values for the selected grid cells
+            swdown_sum = 0.0
+            lwdown_sum = 0.0
+            swdiff_sum = 0.0
+            
+            for i, j in rad_indices:
+                # Extract values and ensure they're floats
+                swdown_val = float(ds_wrf['SWDOWN'].isel(time=closest_idx, south_north=j, west_east=i).values)
+                lwdown_val = float(ds_wrf['GLW'].isel(time=closest_idx, south_north=j, west_east=i).values)
+                swdiff_val = float(ds_wrf['SWDDIF'].isel(time=closest_idx, south_north=j, west_east=i).values)
+                
+                swdown_sum += swdown_val
+                lwdown_sum += lwdown_val
+                swdiff_sum += swdiff_val
+            
+            rad_swdown.append(swdown_sum / ngrids)
+            rad_lwdown.append(lwdown_sum / ngrids)
+            rad_swdiff.append(swdiff_sum / ngrids)
+        
+        rad_values_proc = [rad_swdown, rad_lwdown, rad_swdiff]
+        
+        # Print statistics to verify values
+        print("\nRadiation processing completed. Statistics:")
+        print(f"SWDOWN - Mean: {np.mean(rad_swdown):.2f}, Min: {np.min(rad_swdown):.2f}, Max: {np.max(rad_swdown):.2f} W/m2")
+        print(f"GLW - Mean: {np.mean(rad_lwdown):.2f}, Min: {np.min(rad_lwdown):.2f}, Max: {np.max(rad_lwdown):.2f} W/m2")
+        print(f"SWDDIF - Mean: {np.mean(rad_swdiff):.2f}, Min: {np.min(rad_swdiff):.2f}, Max: {np.max(rad_swdiff):.2f} W/m2")
+        
+        # Print sample values for first few timestamps
+        print("\nSample radiation values (first 3 timestamps):")
+        for i in range(min(3, len(rad_swdown))):
+            print(f"  Timestamp {i}: SWDOWN={rad_swdown[i]:.2f}, GLW={rad_lwdown[i]:.2f}, SWDDIF={rad_swdiff[i]:.2f} W/m2")
+        
+    else:
+        print("Warning: Radiation variables (SWDOWN, GLW, SWDDIF) not found in WRF output")
+        print("Available variables in WRF output:", list(ds_wrf.variables.keys())[:20])  # Show first 20 variables
+        print("Creating empty radiation arrays")
+        rad_times_sec = []
+        rad_values_proc = [[], [], []]
+else:
+    print("Radiation from WRF is disabled in config file")
+    rad_times_sec = []
+    rad_values_proc = [[], [], []]
 
 #-------------------------------------------------------------------------------
 # soil moisture and temperature
@@ -883,33 +1214,52 @@ nc_output['ls_forcing_vg'] = xr.DataArray(ds_geostr["vg"].data,dims=['time','z']
          attrs={'units':'m/s', 'long_name':'v wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
 
 # Add chemistry species to output
-# Conversion factor from μg/m³ to kg/m³
+# Conversion factor from microgram/m3 to kg/m3
 MICROGRAM_TO_KG = 1e-9
 
+# Mapping from WRF variable names to PALM dynamic driver names
+chem_name_mapping = {
+    "hno3": "HNO3",
+    "ho2": "HO2", 
+    "ho": "OH",
+    "no2": "NO2",
+    "o3": "O3",
+    "no": "NO",
+    "qvapor": "H2O",
+    "nh3": "NH3",
+    "so2": "SO2",
+    "co": "CO",
+    "sulf": "H2SO4",
+    "RH": "RH",
+    "RO2": "RO2", 
+    "RCHO": "RCHO",
+    "OCSV": "OCSV",
+    "PM10": "PM10",
+    "PM2_5_DRY": "PM25"
+}
+
+# Use the original chem_species list for output (includes aggregated species)
 for species in chem_species:
-    # Determine the output species name (convert PM2_5_DRY to PM25)
-    output_species_name = species.upper()
-    if output_species_name == "PM2_5_DRY":
-        output_species_name = "PM25"
+    # Get the output species name from mapping
+    output_species_name = chem_name_mapping.get(species, species.upper())
     
     # Add initial profiles
     if species in chem_init:
-        # Convert PM values from μg/m³ to kg/m³
+        # Convert PM values from microgram/m3 to kg/m3, gas species remain in ppm
         if species in ['PM10', 'PM2_5_DRY']:
             converted_data = chem_init[species].data * MICROGRAM_TO_KG
             nc_output[f'init_atmosphere_{output_species_name}'] = xr.DataArray(converted_data, dims=['z'],
                  attrs={'units':'kg/m3', 'lod':np.int32(1), 'source':'WRF-Chem', 'res_origin':res_origin})
         else:
-            # For gas species like no, no2, o3
-            unit = "ppm" if species in ['no', 'no2', 'o3'] else "ppmv"
+            # For gas species - output in ppm (WRF-Chem outputs are in ppmv which is equivalent to ppm for trace gases)
             nc_output[f'init_atmosphere_{output_species_name}'] = xr.DataArray(chem_init[species].data, dims=['z'],
-                 attrs={'units':unit, 'lod':np.int32(1), 'source':'WRF-Chem', 'res_origin':res_origin})
+                 attrs={'units':'ppm', 'lod':np.int32(1), 'source':'WRF-Chem', 'res_origin':res_origin})
     
     # Add boundary conditions
     if species in ds_palm_we.data_vars:
         # West & East boundaries
         if species in ['PM10', 'PM2_5_DRY']:
-            # Convert PM values
+            # Convert PM values from microgram/m3 to kg/m3
             left_data = ds_palm_we[species][:,:,:,0].data * MICROGRAM_TO_KG
             right_data = ds_palm_we[species][:,:,:,-1].data * MICROGRAM_TO_KG
             south_data = ds_palm_sn[species][:,:,0,:].data * MICROGRAM_TO_KG
@@ -917,13 +1267,13 @@ for species in chem_species:
             top_data = chem_top[species] * MICROGRAM_TO_KG
             unit = "kg/m3"
         else:
-            # For gas species
+            # For gas species - use ppm units
             left_data = ds_palm_we[species][:,:,:,0].data
             right_data = ds_palm_we[species][:,:,:,-1].data
             south_data = ds_palm_sn[species][:,:,0,:].data
             north_data = ds_palm_sn[species][:,:,-1,:].data
             top_data = chem_top[species]
-            unit = "ppm" if species in ['no', 'no2', 'o3'] else "ppmv"
+            unit = "ppm"
         
         nc_output[f'ls_forcing_left_{output_species_name}'] = xr.DataArray(left_data, dims=['time', 'z', 'y'],
              attrs={'units':unit, 'source':'WRF-Chem', 'res_origin':res_origin})
@@ -936,6 +1286,26 @@ for species in chem_species:
         nc_output[f'ls_forcing_top_{output_species_name}'] = xr.DataArray(top_data, dims=['time', 'y', 'x'],
              attrs={'units':unit, 'source':'WRF-Chem', 'res_origin':res_origin})
 
+#-------------------------------------------------------------------------------
+# Add radiation data to output
+#-------------------------------------------------------------------------------
+if len(rad_times_sec) > 0 and len(rad_values_proc[0]) > 0:
+    print("Adding radiation data to output file...")
+    
+    # Create radiation time dimension
+    nc_output['time_rad'] = xr.DataArray(rad_times_sec, dims=['time_rad'], 
+                                         attrs={'units':'seconds', 'long_name':'time since simulation start for radiation'})
+    
+    # Add radiation variables
+    nc_output['rad_sw_in'] = xr.DataArray(rad_values_proc[0], dims=['time_rad'],
+                                         attrs={'units':'W/m2', 'lod':1, 'long_name':'shortwave radiation incoming'})
+    nc_output['rad_lw_in'] = xr.DataArray(rad_values_proc[1], dims=['time_rad'],
+                                         attrs={'units':'W/m2', 'lod':1, 'long_name':'longwave radiation incoming'})
+    nc_output['rad_sw_in_dif'] = xr.DataArray(rad_values_proc[2], dims=['time_rad'],
+                                             attrs={'units':'W/m2', 'lod':1, 'long_name':'shortwave radiation incoming diffuse'})
+    print("Radiation data added successfully")
+else:
+    print("No radiation data to add to output file")
 
 for var in nc_output.data_vars:
     encoding = {var: {'dtype': 'float32', '_FillValue': -9999, 'zlib':True}}
@@ -954,11 +1324,8 @@ with open('cfg_files/'+ case_name + '.cfg', "a") as cfg:
         + '\n deep_soil_temperature = ' + str(deep_tsoil)+'\n')
 
 
-
-
 end = datetime.now()
 print('PALM dynamic input file is ready. Script duration: {}'.format(end - start))
 print('Start time: '+str(all_ts[0]))
 print('End time: '+str(all_ts[-1]))
 print('Time step: '+str(times_sec[1]-times_sec[0])+' seconds')
-##
