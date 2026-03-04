@@ -937,166 +937,146 @@ surface_pres = psfc_wrf[:, :,:].mean(dim=["south_north", "west_east"]).load()
 #-------------------------------------------------------------------------------
 # Process radiation data from WRF
 #-------------------------------------------------------------------------------
+rad_times_sec = []
+rad_values_proc = [[], [], []]  # Initialize empty lists
+
 if radiation_from_wrf:
-    print("Processing radiation data from WRF...")
+    print("\n" + "="*60)
+    print("PROCESSING RADIATION DATA FROM WRF")
+    print("="*60)
     
-    # Get radiation variables from WRF
+    # Verify radiation variables exist in the WRF file
     radiation_vars_exist = all(var in ds_wrf.variables for var in ['SWDOWN', 'GLW', 'SWDDIF'])
     
     if radiation_vars_exist:
-        print("Found radiation variables in WRF output (SWDOWN, GLW, SWDDIF)")
+        print(" Found radiation variables in WRF output:")
+        print("  - SWDOWN")
+        print("  - GLW")
+        print("  - SWDDIF")
         
-        # Get all available times from radiation data
-        rad_times = all_ts
-        rad_times_sec = times_sec
+        # Define rad_times_sec for the output file
+        rad_times_sec = times_sec 
+        print(f"\n Radiation times: {len(rad_times_sec)} timestamps from {all_ts[0]} to {all_ts[-1]}")
         
-        # Build list of indices for radiation smoothing (similar to palm_dynamic.py)
-        print('Building list of indices for radiation smoothing...')
+        # Use the same indices that were calculated for meteorology/chemistry
+        # These define the PALM domain boundaries within the WRF grid
+        print(f"\n PALM domain boundaries in WRF grid indices:")
+        print(f"  - west_east:  from {west_idx} to {east_idx}")
+        print(f"  - south_north: from {south_idx} to {north_idx}")
         
-        # Create list of (i,j) indices within smoothing distance of domain center
-        rad_indices = []
-        xcent = centx  # domain center in projected coordinates
-        ycent = centy
+        # Calculate the number of WRF cells covering the PALM domain
+        n_wrf_x = east_idx - west_idx + 1
+        n_wrf_y = north_idx - south_idx + 1
+        ngrids = n_wrf_x * n_wrf_y
+        print(f"  - Grid size: {n_wrf_x} x {n_wrf_y} = {ngrids} WRF cells")
         
-        print(f"Domain center in projected coordinates: ({xcent:.2f}, {ycent:.2f})")
-        
-        # Get dimensions of WRF grid
-        nx_wrf_full = ds_wrf.dims['west_east']
-        ny_wrf_full = ds_wrf.dims['south_north']
-        
-        # Convert WRF grid coordinates to projected coordinates and find indices within smoothing distance
-        if map_proj == 6:
-            # For lat/lon projection
-            lons = ds_wrf.XLONG.isel(time=0).values
-            lats = ds_wrf.XLAT.isel(time=0).values
-            
-            for i in range(nx_wrf_full):
-                for j in range(ny_wrf_full):
-                    lonij = lons[j, i]
-                    latij = lats[j, i]
-                    xij, yij = trans_wrf2palm.transform(lonij, latij)
-                    if abs(xij - xcent) <= radiation_smoothing_distance and \
-                       abs(yij - ycent) <= radiation_smoothing_distance:
-                        rad_indices.append([i, j])
-        else:
-            # For projected WRF grid
-            # Create 2D grids of WRF coordinates
-            X, Y = np.meshgrid(np.arange(nx_wrf_full) * dx_wrf + x0_wrf,
-                              np.arange(ny_wrf_full) * dy_wrf + y0_wrf)
-            
-            # Find indices within smoothing distance
-            distance_mask = (np.abs(X - xcent) <= radiation_smoothing_distance) & \
-                           (np.abs(Y - ycent) <= radiation_smoothing_distance)
-            
-            # Get indices where mask is True
-            j_indices, i_indices = np.where(distance_mask)
-            rad_indices = [[i, j] for i, j in zip(i_indices, j_indices)]
-        
-        ngrids = len(rad_indices)
-        print(f"Found {ngrids} WRF grid cells within {radiation_smoothing_distance}m of domain center for radiation smoothing")
-        
-        # If no grid cells found, use the 3x3 grid around the center
-        if ngrids == 0:
-            print("Warning: No grid cells found within smoothing distance. Using 3x3 grid around domain center.")
-            
-            # Find the nearest grid cell indices to domain center
-            if map_proj == 6:
-                # For lat/lon projection, find nearest grid point
-                lons = ds_wrf.XLONG.isel(time=0).values
-                lats = ds_wrf.XLAT.isel(time=0).values
-                
-                # Convert center to lat/lon
-                trans_palm2wgs = Transformer.from_proj(palm_proj, wgs_proj, always_xy=True)
-                cent_lon, cent_lat = trans_palm2wgs.transform(xcent, ycent)
-                
-                # Find nearest grid indices
-                distances = np.sqrt((lons - cent_lon)**2 + (lats - cent_lat)**2)
-                j_center, i_center = np.unravel_index(np.argmin(distances), distances.shape)
+        if ngrids > 0:
+            # --- GEOGRAPHIC COVERAGE CONFIRMATION ---
+            # Extract the actual lons/lats for the PALM domain area
+            if 'lon' in ds_wrf.coords:
+                lons_verify = ds_wrf.lon.isel(
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+                lats_verify = ds_wrf.lat.isel(
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
             else:
-                # For projected grid, find nearest grid point
-                distances = np.sqrt((X - xcent)**2 + (Y - ycent)**2)
-                j_center, i_center = np.unravel_index(np.argmin(distances), distances.shape)
+                lons_verify = ds_wrf.XLONG.isel(
+                    time=0,
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+                lats_verify = ds_wrf.XLAT.isel(
+                    time=0,
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+
+            print("\n--- GEOGRAPHIC COVERAGE CONFIRMATION ---")
+            print(f"WRF cells covering PALM domain:")
+            print(f"  Longitude range: {lons_verify.min():.5f} to {lons_verify.max():.5f}")
+            print(f"  Latitude range:  {lats_verify.min():.5f} to {lats_verify.max():.5f}")
+            print(f"  Your PALM Center: {centlon:.5f}, {centlat:.5f}")
             
-            print(f"Nearest grid cell at indices: i={i_center}, j={j_center}")
+            # Convert PALM domain boundaries to lat/lon for verification
+            trans_palm2wgs = Transformer.from_proj(palm_proj, wgs_proj, always_xy=True)
+            sw_lon, sw_lat = trans_palm2wgs.transform(west, south)
+            ne_lon, ne_lat = trans_palm2wgs.transform(east, north)
+            print(f"\nYour PALM Domain (lat/lon):")
+            print(f"  SW corner: ({sw_lon:.5f}, {sw_lat:.5f})")
+            print(f"  NE corner: ({ne_lon:.5f}, {ne_lat:.5f})")
             
-            # Use 3x3 grid around the center (if within bounds)
-            i_min = max(0, i_center - 1)
-            i_max = min(nx_wrf_full - 1, i_center + 1)
-            j_min = max(0, j_center - 1)
-            j_max = min(ny_wrf_full - 1, j_center + 1)
+            # Verify coverage
+            if (lons_verify.min() <= sw_lon <= lons_verify.max() and
+                lons_verify.min() <= ne_lon <= lons_verify.max() and
+                lats_verify.min() <= sw_lat <= lats_verify.max() and
+                lats_verify.min() <= ne_lat <= lats_verify.max()):
+                print("WRF cells correctly cover your PALM domain")
+            else:
+                print("⚠ WARNING: Possible coordinate mismatch!")
+            print("----------------------------------------\n")
             
-            rad_indices = []
-            for i in range(i_min, i_max + 1):
-                for j in range(j_min, j_max + 1):
-                    rad_indices.append([i, j])
+            # Process radiation data for ALL cells within PALM domain
+            print(f"\n Processing radiation data over {ngrids} WRF cells covering PALM domain...")
             
-            ngrids = len(rad_indices)
-            print(f"Using {ngrids} grid cells in a {i_max-i_min+1}x{j_max-j_min+1} grid around the center")
-        
-        # Process radiation data for each timestamp - using proper WRF-Chem time handling
-        print("Processing radiation data for all timestamps...")
-        
-        rad_swdown = []
-        rad_lwdown = []
-        rad_swdiff = []
-        
-        # Get all WRF times as datetime objects for proper comparison
-        wrf_times = ds_wrf.time.values
-        
-        for ts in tqdm(range(len(all_ts)), desc="Radiation processing", position=0, leave=True):
-            current_time = all_ts[ts]
+            rad_swdown, rad_lwdown, rad_swdiff = [], [], []
+            wrf_times = ds_wrf.time.values
             
-            # Find the closest WRF time index
-            time_diffs = np.abs(wrf_times - current_time)
-            closest_idx = np.argmin(time_diffs)
-            time_diff_seconds = time_diffs[closest_idx].astype('timedelta64[s]').astype(float)
-            
-            if time_diff_seconds > 3600:  # More than 1 hour difference
-                print(f"Warning: Large time difference ({time_diff_seconds/3600:.1f} hours) at timestamp {ts}")
-            
-            # Get radiation values for the selected grid cells
-            swdown_sum = 0.0
-            lwdown_sum = 0.0
-            swdiff_sum = 0.0
-            
-            for i, j in rad_indices:
-                # Extract values and ensure they're floats
-                swdown_val = float(ds_wrf['SWDOWN'].isel(time=closest_idx, south_north=j, west_east=i).values)
-                lwdown_val = float(ds_wrf['GLW'].isel(time=closest_idx, south_north=j, west_east=i).values)
-                swdiff_val = float(ds_wrf['SWDDIF'].isel(time=closest_idx, south_north=j, west_east=i).values)
+            for ts in tqdm(range(len(all_ts)), desc="  Radiation processing", unit="timestep"):
+                current_time = all_ts[ts]
+                time_diffs = np.abs(wrf_times - current_time)
+                closest_idx = np.argmin(time_diffs)
                 
-                swdown_sum += swdown_val
-                lwdown_sum += lwdown_val
-                swdiff_sum += swdiff_val
+                # Extract the cropped radiation data for this timestep
+                sw_cropped = ds_wrf['SWDOWN'].isel(
+                    time=closest_idx,
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+                
+                lw_cropped = ds_wrf['GLW'].isel(
+                    time=closest_idx,
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+                
+                dif_cropped = ds_wrf['SWDDIF'].isel(
+                    time=closest_idx,
+                    west_east=slice(west_idx, east_idx + 1),
+                    south_north=slice(south_idx, north_idx + 1)
+                ).values
+                
+                # Average over all WRF cells in the PALM domain
+                rad_swdown.append(np.mean(sw_cropped))
+                rad_lwdown.append(np.mean(lw_cropped))
+                rad_swdiff.append(np.mean(dif_cropped))
+                
             
-            rad_swdown.append(swdown_sum / ngrids)
-            rad_lwdown.append(lwdown_sum / ngrids)
-            rad_swdiff.append(swdiff_sum / ngrids)
-        
-        rad_values_proc = [rad_swdown, rad_lwdown, rad_swdiff]
-        
-        # Print statistics to verify values
-        print("\nRadiation processing completed. Statistics:")
-        print(f"SWDOWN - Mean: {np.mean(rad_swdown):.2f}, Min: {np.min(rad_swdown):.2f}, Max: {np.max(rad_swdown):.2f} W/m2")
-        print(f"GLW - Mean: {np.mean(rad_lwdown):.2f}, Min: {np.min(rad_lwdown):.2f}, Max: {np.max(rad_lwdown):.2f} W/m2")
-        print(f"SWDDIF - Mean: {np.mean(rad_swdiff):.2f}, Min: {np.min(rad_swdiff):.2f}, Max: {np.max(rad_swdiff):.2f} W/m2")
-        
-        # Print sample values for first few timestamps
-        print("\nSample radiation values (first 3 timestamps):")
-        for i in range(min(3, len(rad_swdown))):
-            print(f"  Timestamp {i}: SWDOWN={rad_swdown[i]:.2f}, GLW={rad_lwdown[i]:.2f}, SWDDIF={rad_swdiff[i]:.2f} W/m2")
-        
+            rad_values_proc = [rad_swdown, rad_lwdown, rad_swdiff]
+            
+            print("\nRadiation processing complete!")
+            print("Statistics over all timestamps (domain-averaged values):")
+            print(f"SWDOWN (W/m²) - Mean: {np.mean(rad_swdown):.2f}, Min: {np.min(rad_swdown):.2f}, Max: {np.max(rad_swdown):.2f}")
+            print(f"GLW    (W/m²) - Mean: {np.mean(rad_lwdown):.2f}, Min: {np.min(rad_lwdown):.2f}, Max: {np.max(rad_lwdown):.2f}")
+            print(f"SWDDIF (W/m²) - Mean: {np.mean(rad_swdiff):.2f}, Min: {np.min(rad_swdiff):.2f}, Max: {np.max(rad_swdiff):.2f}")
+            
     else:
-        print("Warning: Radiation variables (SWDOWN, GLW, SWDDIF) not found in WRF output")
-        print("Available variables in WRF output:", list(ds_wrf.variables.keys())[:20])  # Show first 20 variables
-        print("Creating empty radiation arrays")
+        print(" Warning: Radiation variables (SWDOWN, GLW, SWDDIF) not found in WRF output")
+        print(f"  Available variables in WRF output (first 20):")
+        for i, var in enumerate(list(ds_wrf.variables.keys())[:20]):
+            print(f"    {i+1:2d}. {var}")
+        print("  Creating empty radiation arrays")
         rad_times_sec = []
         rad_values_proc = [[], [], []]
 else:
-    print("Radiation from WRF is disabled in config file")
+    print("\n Radiation from WRF is disabled in config file")
     rad_times_sec = []
     rad_values_proc = [[], [], []]
 
+print("\n" + "="*60)
+    
 #-------------------------------------------------------------------------------
 # soil moisture and temperature
 #-------------------------------------------------------------------------------
