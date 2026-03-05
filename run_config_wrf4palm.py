@@ -26,6 +26,28 @@ import warnings
 warnings.filterwarnings("ignore", '.*pyproj.*')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
+#-------------------------------------------------------------------------------
+# Function to setup traffic variables
+#-------------------------------------------------------------------------------
+def setup_traffic_variables(chem_species):
+    """
+    Check if traffic variables are requested and set up the mapping
+    Returns: tuple (has_traffic, traffic_mapping)
+    """
+    traffic_mapping = {}
+    has_traffic = False
+    
+    # Check for traffic variables in the species list
+    for species in chem_species:
+        if species.endswith('_traffic'):
+            base_species = species.replace('_traffic', '')
+            if base_species in ['no', 'no2']:  # Only support NO and NO2 for now
+                traffic_mapping[base_species] = species
+                has_traffic = True
+                print(f"Traffic variable requested: {species} (based on {base_species})")
+    
+    return has_traffic, traffic_mapping
+
 start = datetime.now()
 
 if not os.path.exists("./cfg_files"):
@@ -63,6 +85,19 @@ else:
     chem_species = [chem_species_raw]
 
 print(f"Final chemistry species: {chem_species}")
+
+#-------------------------------------------------------------------------------
+# Check for traffic variables
+#-------------------------------------------------------------------------------
+has_traffic_vars, traffic_mapping = setup_traffic_variables(chem_species)
+
+# Remove traffic variants from the processing list since they're duplicates
+# But keep them in the output species list
+original_chem_species = chem_species.copy()  # Keep original for output
+chem_species_for_processing = [s for s in chem_species if not s.endswith('_traffic')]
+
+print(f"Chemistry species for processing: {chem_species_for_processing}")
+print(f"Traffic variables to create: {traffic_mapping}")
 
 # Read radiation settings from config
 try:
@@ -109,7 +144,7 @@ if "OCSV" in chem_species:
 all_component_species = list(set(all_component_species))
 
 # Combine regular chemistry species with component species for processing
-all_chem_to_process = list(set(chem_species + all_component_species))
+all_chem_to_process = list(set(chem_species_for_processing + all_component_species))
 # added later
 all_chem_to_process = [s for s in all_chem_to_process if s not in ["RH", "RO2", "RCHO", "OCSV"]]
 
@@ -592,11 +627,23 @@ print("Processing V for south and north boundaries")
 ds_palm_sn["V"] = multi_zinterp(max_pool, ds_sn_vstag, "V", z, ds_palm_sn)
 
 #-------------------------------------------------------------------------------
+# Handle traffic variables in boundary conditions
+#-------------------------------------------------------------------------------
+if has_traffic_vars:
+    print("Setting up traffic variables in boundary conditions...")
+    for base_species, traffic_species in traffic_mapping.items():
+        # Copy boundary data from base species to traffic species
+        if base_species in ds_palm_we.data_vars:
+            ds_palm_we[traffic_species] = ds_palm_we[base_species].copy()
+            ds_palm_sn[traffic_species] = ds_palm_sn[base_species].copy()
+            print(f"  Created {traffic_species} boundary conditions from {base_species}")
+
+#-------------------------------------------------------------------------------
 # Handle NaN values in chemistry boundary conditions
 #-------------------------------------------------------------------------------
 print("Handling NaN values in chemistry boundary conditions...")
 # Now use the original chem_species list for NaN handling (includes aggregated species)
-for species in chem_species:
+for species in original_chem_species:
     if species in ds_palm_we.data_vars:
         print(f"Checking for NaN values in {species} boundary conditions...")
         
@@ -755,9 +802,20 @@ if "OCSV" in chem_species:
             if comp in chem_top:
                 chem_top["OCSV"][ts, :, :] += chem_top[comp][ts, :, :]
 
+#-------------------------------------------------------------------------------
+# Handle traffic variables in top boundary
+#-------------------------------------------------------------------------------
+if has_traffic_vars:
+    print("Setting up traffic variables in top boundary...")
+    for base_species, traffic_species in traffic_mapping.items():
+        # Copy top boundary data from base species to traffic species
+        if base_species in chem_top:
+            chem_top[traffic_species] = chem_top[base_species].copy()
+            print(f"  Created {traffic_species} top boundary from {base_species}")
+
 # Handle NaN values in top boundary chemistry data using the same approach
 print("Handling NaN values in top boundary...")
-for species in chem_species:
+for species in original_chem_species:
     if species in chem_top:
         if np.any(np.isnan(chem_top[species])):
             print(f"Found NaN values for {species} in top boundary")
@@ -931,6 +989,17 @@ if "OCSV" in chem_species:
         if comp in chem_init:
             ocsv_init += chem_init[comp].values
     chem_init["OCSV"] = xr.DataArray(ocsv_init, dims=['z'], coords={'z': z})
+
+#-------------------------------------------------------------------------------
+# Handle traffic variables in initial profiles
+#-------------------------------------------------------------------------------
+if has_traffic_vars:
+    print("Setting up traffic variables in initial profiles...")
+    for base_species, traffic_species in traffic_mapping.items():
+        if base_species in chem_init:
+            # Create traffic variable as a copy of the base species
+            chem_init[traffic_species] = chem_init[base_species].copy()
+            print(f"  Created {traffic_species} initial profile from {base_species}")
 
 surface_pres = psfc_wrf[:, :,:].mean(dim=["south_north", "west_east"]).load()
 
@@ -1218,10 +1287,18 @@ chem_name_mapping = {
     "PM2_5_DRY": "PM25"
 }
 
-# Use the original chem_species list for output (includes aggregated species)
-for species in chem_species:
-    # Get the output species name from mapping
-    output_species_name = chem_name_mapping.get(species, species.upper())
+# Use the original chem_species list for output (includes aggregated species and traffic variables)
+for species in original_chem_species:
+    # Get the output species name from mapping or use the species name directly
+    if species.endswith('_traffic'):
+        # For traffic variables, keep the suffix in lowercase
+        base = species.replace('_traffic', '')
+        if base in chem_name_mapping:
+            output_species_name = f"{chem_name_mapping[base]}_traffic"
+        else:
+            output_species_name = f"{base.upper()}_traffic"
+    else:
+        output_species_name = chem_name_mapping.get(species, species.upper())
     
     # Add initial profiles
     if species in chem_init:
