@@ -118,16 +118,17 @@ print(f"Radiation smoothing distance: {radiation_smoothing_distance} m")
 # Define component species for aggregated species (needed for processing)
 RH_components = ["isopr", "apin", "bpin", "limon", "bcary", "myrc", 
                 "benzene", "tol", "xylenes", "bigalk", "bigene", 
-                "c2h4", "c2h2", "c3h6"]
+                "c2h4", "c3h6"]  #"c2h2",
 
-RO2_components = ["ch3o2", "aco3", "mco3", "alko2", "aceto2", "benzo2", 
-                 "eto2", "pro2", "po2", "xo2", "terpo2", "terp2o2", 
+RO2_components = ["ch3o2", "aco3", "mco3", "alko2", "aceto2", #"benzo2", 
+                 "eto2", "pro2", "po2", "terpo2", "terp2o2",  #"xo2",
                  "nterpo2", "isopao2", "isopbo2", "mdialo2", "dicarbo2"]
 
-RCHO_components = ["ald", "bzald", "glyald", "hydrald", "gly", "mgly", "hcho"]
+RCHO_components = ["ald", "bzald", "glyald", "hydrald", "gly", "mgly", "hcho"]  #
 
-OCSV_components = ["cvasoaX", "cvasoa1", "cvasoa2", "cvasoa3", "cvasoa4", 
-                  "cvbsoaX", "cvbsoa1", "cvbsoa2", "cvbsoa3", "cvbsoa4"]
+OCSV_components = [ "cvasoa2", "cvasoa3", "cvasoa4",  "cvbsoa2", "cvbsoa3", "cvbsoa4"]
+
+OCNV_components = ["cvasoaX", "cvasoa1", "cvbsoaX", "cvbsoa1"]
 
 # Create a list of all component species needed for aggregation
 all_component_species = []
@@ -139,6 +140,8 @@ if "RCHO" in chem_species:
     all_component_species.extend(RCHO_components)
 if "OCSV" in chem_species:
     all_component_species.extend(OCSV_components)
+if "OCNV" in chem_species:
+    all_component_species.extend(OCNV_components)
 
 # Remove duplicates
 all_component_species = list(set(all_component_species))
@@ -146,7 +149,7 @@ all_component_species = list(set(all_component_species))
 # Combine regular chemistry species with component species for processing
 all_chem_to_process = list(set(chem_species_for_processing + all_component_species))
 # added later
-all_chem_to_process = [s for s in all_chem_to_process if s not in ["RH", "RO2", "RCHO", "OCSV"]]
+all_chem_to_process = [s for s in all_chem_to_process if s not in ["RH", "RO2", "RCHO", "OCSV", "OCNV"]]
 
 print(f"All chemistry species to process: {all_chem_to_process}")
 
@@ -593,6 +596,10 @@ if "OCSV" in chem_species:
     ds_palm_we["OCSV"], ds_palm_sn["OCSV"] = calculate_aggregated_from_interpolated(
         ds_palm_we, ds_palm_sn, "OCSV", OCSV_components)
 
+if "OCNV" in chem_species:
+    print("Calculating OCNV from interpolated components...")
+    ds_palm_we["OCNV"], ds_palm_sn["OCNV"] = calculate_aggregated_from_interpolated(
+        ds_palm_we, ds_palm_sn, "OCNV", OCNV_components)
 
 # interpolate w
 zeros_we_w = np.zeros((len(all_ts), len(zw), len(y), len(x[:2])))
@@ -802,6 +809,14 @@ if "OCSV" in chem_species:
             if comp in chem_top:
                 chem_top["OCSV"][ts, :, :] += chem_top[comp][ts, :, :]
 
+if "OCNV" in chem_species:
+    print("Calculating OCNV for top boundary...")
+    chem_top["OCNV"] = np.zeros((len(all_ts), len(y), len(x)))
+    for ts in range(len(all_ts)):
+        for comp in OCNV_components:
+            if comp in chem_top:
+                chem_top["OCNV"][ts, :, :] += chem_top[comp][ts, :, :]
+
 #-------------------------------------------------------------------------------
 # Handle traffic variables in top boundary
 #-------------------------------------------------------------------------------
@@ -989,6 +1004,13 @@ if "OCSV" in chem_species:
         if comp in chem_init:
             ocsv_init += chem_init[comp].values
     chem_init["OCSV"] = xr.DataArray(ocsv_init, dims=['z'], coords={'z': z})
+
+if "OCNV" in chem_species:
+    ocnv_init = np.zeros(len(z))
+    for comp in OCNV_components:
+        if comp in chem_init:
+            ocnv_init += chem_init[comp].values
+    chem_init["OCNV"] = xr.DataArray(ocnv_init, dims=['z'], coords={'z': z})
 
 #-------------------------------------------------------------------------------
 # Handle traffic variables in initial profiles
@@ -1257,10 +1279,10 @@ nc_output['surface_forcing_surface_pressure'] = xr.DataArray(surface_pres.data, 
          attrs={'units':'Pa', 'lod':np.int32(1), 'source':'WRF', 'res_origin':res_origin})
 
 
-'''nc_output['ls_forcing_ug'] = xr.DataArray(ds_geostr["ug"].data,dims=['time','z'],
-         attrs={'units':'m/s', 'long_name':'u wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
-nc_output['ls_forcing_vg'] = xr.DataArray(ds_geostr["vg"].data,dims=['time','z'],
-         attrs={'units':'m/s', 'long_name':'v wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})'''
+#nc_output['ls_forcing_ug'] = xr.DataArray(ds_geostr["ug"].data,dims=['time','z'],
+#         attrs={'units':'m/s', 'long_name':'u wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
+#nc_output['ls_forcing_vg'] = xr.DataArray(ds_geostr["vg"].data,dims=['time','z'],
+#         attrs={'units':'m/s', 'long_name':'v wind component geostrophic', 'source':'WRF', 'res_origin':res_origin})
 
 # Add chemistry species to output
 # Conversion factor from microgram/m3 to kg/m3
@@ -1283,6 +1305,7 @@ chem_name_mapping = {
     "RO2": "RO2", 
     "RCHO": "RCHO",
     "OCSV": "OCSV",
+    "OCNV": "OCNV",
     "PM10": "PM10",
     "PM2_5_DRY": "PM25"
 }
