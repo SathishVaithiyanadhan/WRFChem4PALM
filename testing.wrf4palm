@@ -1,18 +1,20 @@
 [case]
 case_name = "testing",
-max_pool = 8,
+max_pool = 2,
 geostrophic = " ", ## calculate geostrophic wind using the variable pressure (option "p") or geopotential height  (option "z")
 
 [domain]
 palm_proj = "EPSG:25832",    # projection of PALM
-centlat = 48.36587,
+# centlat = 48.37641, #Bourges platz station location
+# centlon = 10.88836, 
+centlat = 48.36587,  #Königsplatz
 centlon = 10.89428, 
 nx        = 100,                                  # number of grid points along x-axis
 ny        = 100,                                  # number of grid points along y-axis
 nz        = 50,                                  # number of grid points along z-axis
-dx        = 5.0,                                 # number of grid points along x-axis
-dy        = 5.0,                                 # number of grid points along y-axis
-dz        = 5.0,                                 # number of grid points along z-axis
+dx        = 10.0,                                 # number of grid points along x-axis
+dy        = 10.0,                                 # number of grid points along y-axis
+dz        = 10.0,                                 # number of grid points along z-axis
 z_origin  = 508.0,                                # elevated mean grid position (elevated terrain)
 
 [stretch]
@@ -46,12 +48,34 @@ dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
 msoil = 0.3, # dummy value in case soil moisture from WRF output is 0.0
 
 [chemistry] 
-# species = ["PM10","PM2_5_DRY","hno3","ho2","ho","no2","o3","no","nh3","so2","co", "sulf", "RH","RO2","RCHO","OCSV"], 
- species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no"], #simple_mechanism
-# species = ["PM10","PM2_5_DRY"]
-# chemical species to include from WRF-Chem - "PM10","PM2_5_DRY","hno3","ho2","ho","no2","o3","no","nh3","so2","co", "sulf", "RH","RO2","RCHO","OCSV"
+ species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV"]   #salsa+simple
+# species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "no2_traffic","no_traffic"]   #salsa+simple_tra
+# species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no", "no2_traffic","no_traffic"]   #simple_traffic
+# species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no"]   #simplec
+#species = ["PM10","PM2_5_DRY"] #passive
+# species = []
+# chemical species to include from WRF-Chem - "PM10","PM2_5_DRY","hno3","ho2","ho","no2","o3","no","nh3","so2","co", "sulf", "RH","RO2","RCHO","OCSV", "OCNV"
 
 [radiation]
-# Radiation settings (based on palm_dynamic.py and O3_small.conf)
-radiation_from_wrf = True,    # Extract radiation data from WRF output
-radiation_smoothing_distance = 10000.0,  # Distance (in meters) around domain center to average radiation data
+# Radiation settings 
+radiation_from_wrf = True
+radiation_smoothing_distance = 10000.0  # Distance (in meters) around domain center to average radiation data
+
+[aerosol]
+# Enable aerosol processing
+process_aerosols = True
+
+# Aerosol number concentration bins
+# These will be converted to total #/m3 for PALM
+number_species = ["num_a01", "num_a02", "num_a03", "num_a04"]
+
+# Aerosol mass species listspec (SALSA composition names)
+listspec = ['DU','SO4','OC','BC','SS','NH','NO']
+
+# SALSA parameters for bin definition
+nbin = [1, 7]                          # [bins in subrange 1, bins in subrange 2]
+reglim = [3.0e-9, 1.0e-8, 2.5e-6] #[3.9e-8, 5.0e-8, 2.5e-6]   [2.5E-9, 1.5E-8, 1.0E-6] [3.0e-9, 1.0e-8, 2.5e-6]   # [d_min, d_split, d_max] in meters
+nf2a = 1.0                              # Factor for bin width calculation
+
+# WRF-Chem bin limits for mapping (if needed)
+wrfchem_bin_limits = [3.9e-8, 1.56e-7, 6.25e-7, 2.5e-6, 1.0e-5]

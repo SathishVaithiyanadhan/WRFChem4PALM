@@ -1,3 +1,4 @@
+#aerosols 
 # -*- coding: utf-8 -*-
 import sys
 import os
@@ -1167,7 +1168,135 @@ else:
     rad_values_proc = [[], [], []]
 
 print("\n" + "="*60)
+
+#-------------------------------------------------------------------------------
+# Import aerosol processing module
+#-------------------------------------------------------------------------------
+from dynamic_util.wrfchem_aerosol import WRFChemAerosolProcessor, setup_aerosol_processing
+
+# Read aerosol settings from config
+aerosol_config = {
+    'process_aerosols': False,
+    'listspec': [],
+    'nbin': [],
+    'reglim': [],
+    'nf2a': 1.0,
+    'number_species': [],
+    'process_cloud_aerosols': False,
+    'process_condensable_vapors': False,
+    'oc_solubility_factor': 0.5
+}
+
+try:
+    # Check if aerosol processing is enabled
+    process_val = config.get("aerosol", "process_aerosols")
+    try:
+        aerosol_config['process_aerosols'] = ast.literal_eval(process_val)
+        if isinstance(aerosol_config['process_aerosols'], (list, tuple)):
+            aerosol_config['process_aerosols'] = aerosol_config['process_aerosols'][0]
+    except:
+        aerosol_config['process_aerosols'] = process_val.lower() == 'true'
     
+    # Read listspec (SALSA composition names)
+    try:
+        listspec_val = config.get("aerosol", "listspec")
+        aerosol_config['listspec'] = ast.literal_eval(listspec_val)
+        print(f"Aerosol composition list (SALSA): {aerosol_config['listspec']}")
+    except:
+        print("No listspec found in aerosol section")
+    
+    # Read number concentration species
+    try:
+        num_val = config.get("aerosol", "number_species")
+        aerosol_config['number_species'] = ast.literal_eval(num_val)
+        print(f"Aerosol number species: {aerosol_config['number_species']}")
+    except:
+        print("No number_species found in aerosol section")
+    
+    # Read SALSA bin parameters
+    try:
+        nbin_val = config.get("aerosol", "nbin")
+        aerosol_config['nbin'] = ast.literal_eval(nbin_val)
+        print(f"Aerosol bins: {aerosol_config['nbin']}")
+    except:
+        print("No nbin found in aerosol section, using default [1,7]")
+    
+    try:
+        reglim_val = config.get("aerosol", "reglim")
+        aerosol_config['reglim'] = ast.literal_eval(reglim_val)
+        print(f"Aerosol bin limits (m): {aerosol_config['reglim']}")
+    except:
+        print("No reglim found in aerosol section, using default")
+    
+    try:
+        nf2a_val = config.get("aerosol", "nf2a")
+        aerosol_config['nf2a'] = ast.literal_eval(nf2a_val)
+        if isinstance(aerosol_config['nf2a'], (list, tuple)):
+            aerosol_config['nf2a'] = aerosol_config['nf2a'][0]
+        print(f"Aerosol nf2a: {aerosol_config['nf2a']}")
+    except:
+        print("No nf2a found in aerosol section, using default 1.0")
+    
+    # Read optional settings
+    try:
+        cloud_val = config.get("aerosol", "process_cloud_aerosols")
+        aerosol_config['process_cloud_aerosols'] = ast.literal_eval(cloud_val)
+        if isinstance(aerosol_config['process_cloud_aerosols'], (list, tuple)):
+            aerosol_config['process_cloud_aerosols'] = aerosol_config['process_cloud_aerosols'][0]
+    except:
+        pass
+    
+    try:
+        vapor_val = config.get("aerosol", "process_condensable_vapors")
+        aerosol_config['process_condensable_vapors'] = ast.literal_eval(vapor_val)
+        if isinstance(aerosol_config['process_condensable_vapors'], (list, tuple)):
+            aerosol_config['process_condensable_vapors'] = aerosol_config['process_condensable_vapors'][0]
+    except:
+        pass
+    
+    # Read OC solubility factor
+    try:
+        oc_val = config.get("aerosol", "oc_solubility_factor")
+        aerosol_config['oc_solubility_factor'] = ast.literal_eval(oc_val)
+        if isinstance(aerosol_config['oc_solubility_factor'], (list, tuple)):
+            aerosol_config['oc_solubility_factor'] = aerosol_config['oc_solubility_factor'][0]
+    except:
+        pass
+    
+except Exception as e:
+    print(f"Aerosol settings not found or error reading: {e}")
+    print("Disabling aerosol processing")
+
+# Setup aerosol processing
+has_aerosols, aerosol_processor = setup_aerosol_processing(aerosol_config)
+if has_aerosols:
+    print(f"\nAerosol processing enabled")
+    print(f"  Composition list: {aerosol_config['listspec']}")
+    print(f"  Number species: {aerosol_config['number_species']}")
+    print(f"  Bins: {aerosol_config['nbin']}")
+    print(f"  Bin limits: {aerosol_config['reglim']}")
+    print(f"  Process cloud aerosols: {aerosol_config['process_cloud_aerosols']}")
+    print(f"  Process condensable vapors: {aerosol_config['process_condensable_vapors']}")
+    
+    # Add aerosol variables to the variable list for boundary processing
+    if has_aerosols and aerosol_processor is not None:
+        # Add number concentration variables
+        for num_species in aerosol_config['number_species']:
+            if num_species not in varbc_list:
+                varbc_list.append(num_species)
+        
+        # Add mass variables (with bin suffixes) - use expanded species
+        for base_species in aerosol_processor.expanded_species:
+            for bin_idx in range(aerosol_processor.nbins):
+                bin_name = f"a0{bin_idx+1}" if bin_idx < 9 else f"a{bin_idx+1}"
+                mass_var = f"{base_species}_{bin_name}"
+                if mass_var not in varbc_list:
+                    varbc_list.append(mass_var)
+    
+    print(f"Updated variable list with aerosol species")
+else:
+    print("Aerosol processing disabled")
+
 #-------------------------------------------------------------------------------
 # soil moisture and temperature
 #-------------------------------------------------------------------------------
@@ -1367,6 +1496,368 @@ for species in original_chem_species:
              attrs={'units':unit, 'source':'WRF-Chem', 'res_origin':res_origin})
 
 #-------------------------------------------------------------------------------
+# Add AEROSOL species to output
+#-------------------------------------------------------------------------------
+if has_aerosols:
+    print("\n" + "="*60)
+    print("ADDING AEROSOL SPECIES TO OUTPUT")
+    print("="*60)
+    
+    # Process aerosol data using the ORIGINAL WRF dataset for the actual data
+    # and the interpolated dataset for the horizontal grid mapping
+    print("Processing aerosol data for all timesteps...")
+    
+    time_indices = list(range(len(all_ts)))
+    
+    palm_aerosol = aerosol_processor.prepare_palm_aerosol_variables(
+        ds_wrf,           # Original WRF dataset (has aerosol variables)
+        ds_interp,        # Interpolated dataset (has PALM horizontal grid)
+        time_indices, 
+        z,                # PALM vertical levels
+        y,                # PALM y coordinates
+        x                 # PALM x coordinates
+    )
+    
+    # Get species names from listspec (7 species)
+    species_names = aerosol_processor.listspec  # This gives ['DU','SO4','OC','BC','SS','NH','NO']
+    n_species = len(species_names)
+    n_bins = aerosol_processor.nbins
+    n_times = len(all_ts)
+    n_z = len(z)
+    n_y = len(y)
+    n_x = len(x)
+    
+    #-------------------------------------------------------------------------------
+    # Define all dimensions and coordinate variables FIRST
+    #-------------------------------------------------------------------------------
+    
+    # Add geometric mean diameters for each bin
+    nc_output['Dmid'] = xr.DataArray(
+        aerosol_processor.dmid.astype(np.float32), dims=['Dmid'],
+        attrs={'units': 'm', 'long_name': 'aerosol bin geometric mean diameters'}
+    )
+    print(f"  Added Dmid variable with {n_bins} bins (float32)")
+
+    # Add max_string_length dimension and variable
+    max_string_length = 25
+    nc_output['max_string_length'] = xr.DataArray(
+        np.arange(1, max_string_length + 1, dtype=np.float32), 
+        dims=['max_string_length'],
+        attrs={'units': '-', 'long_name': 'maximum string length'}
+    )
+    print(f"  Created max_string_length dimension and variable with values 1-{max_string_length} (float32)")
+
+    # Add composition index for mass fractions
+    if n_species > 0:
+        # Create composition index values as FLOAT
+        comp_index_data = np.arange(1, n_species + 1, dtype=np.float32)
+        
+        # Create the composition_index variable (FLOAT)
+        nc_output['composition_index'] = xr.DataArray(
+            comp_index_data, 
+            dims=['composition_index'],
+            attrs={
+                'long_name': 'aerosol species index',
+                'units': '1',
+                'standard_name': 'aerosol_species_index'
+            }
+        )
+        print(f"  Added composition_index with {n_species} indices (float32)")
+        
+        #-----------------------------------------------------------------------
+        # Create composition_name as proper CHAR array 
+        # with dimensions (composition_index, max_string_length)
+        #-----------------------------------------------------------------------
+        
+        # Create a character array with dtype='S1'
+        char_array = np.zeros((n_species, max_string_length), dtype='S1')
+        
+        # Fill with species names
+        for i, name in enumerate(species_names):
+            name_bytes = name.encode('utf-8')
+            name_len = min(len(name_bytes), max_string_length)
+            char_array[i, :name_len] = [bytes([b]) for b in name_bytes[:name_len]]
+            # Remaining positions are already zeros (null bytes)
+        
+        # Create the composition_name variable as a char array
+        nc_output['composition_name'] = xr.DataArray(
+            char_array,
+            dims=['composition_index', 'max_string_length'],
+            attrs={
+                'long_name': 'aerosol species names',
+                'units': '-',
+                'standard_name': 'aerosol_species_name'
+            }
+        )
+        
+        print(f"  Added composition_name with dimensions (composition_index={n_species}, max_string_length={max_string_length}) as char")
+        print(f"  Species names: {species_names}")
+        print(f"  Species mapping:")
+        for i, name in enumerate(species_names, 1):
+            print(f"    Index {i}: {name}")
+    
+    #-------------------------------------------------------------------------------
+    # Size-resolved aerosol number concentration (with Dmid dimension)
+    #-------------------------------------------------------------------------------
+    
+    # Initial profile - size-resolved (z, Dmid)
+    aerosol_num_init = np.mean(palm_aerosol['aerosol_num'][0, :, :, :, :], axis=(1, 2))
+    nc_output['init_atmosphere_aerosol'] = xr.DataArray(
+        aerosol_num_init.astype(np.float32), 
+        dims=['z', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem',
+               'long_name': 'initial aerosol number concentration per bin'}
+    )
+    print("  Added init_atmosphere_aerosol(z, Dmid) (#/m3)")
+    
+    #-------------------------------------------------------------------------------
+    # Mass fractions (soluble = Mode A, insoluble = Mode B)
+    #-------------------------------------------------------------------------------
+    if n_species > 0 and palm_aerosol['mass_fracs_a'] is not None:
+        # Initial profiles - average over horizontal domain
+        mf_a_init = np.mean(palm_aerosol['mass_fracs_a'][0, :, :, :, :], axis=(1, 2)).astype(np.float32)
+        mf_b_init = np.mean(palm_aerosol['mass_fracs_b'][0, :, :, :, :], axis=(1, 2)).astype(np.float32)
+        
+        nc_output['init_atmosphere_mass_fracs_a'] = xr.DataArray(
+            mf_a_init, dims=['z', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem',
+                   'long_name': 'initial mass fraction - SOLUBLE components (Mode A)'}
+        )
+        nc_output['init_atmosphere_mass_fracs_b'] = xr.DataArray(
+            mf_b_init, dims=['z', 'composition_index'],
+            attrs={'units': '',  'source': 'WRF-Chem',
+                   'long_name': 'initial mass fraction - INSOLUBLE components (Mode B)'}
+        )
+        print(f"  Added init_atmosphere_mass_fracs_a/b(z, composition_index) with {n_species} species")
+        
+        #-----------------------------------------------------------------------
+        # Boundary conditions for mass fractions
+        #-----------------------------------------------------------------------
+        mf_a_full = palm_aerosol['mass_fracs_a'].astype(np.float32)  # Shape: [time, z, y, x, 7]
+        mf_b_full = palm_aerosol['mass_fracs_b'].astype(np.float32)  # Shape: [time, z, y, x, 7]
+        
+        # Left/Right boundaries (west/east)
+        nc_output['ls_forcing_left_mass_fracs_a'] = xr.DataArray(
+            mf_a_full[:, :, :, 0, :], dims=['time', 'z', 'y', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'soluble mass fraction (Mode A) - west boundary'}
+        )
+        nc_output['ls_forcing_right_mass_fracs_a'] = xr.DataArray(
+            mf_a_full[:, :, :, -1, :], dims=['time', 'z', 'y', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'soluble mass fraction (Mode A) - east boundary'}
+        )
+        nc_output['ls_forcing_left_mass_fracs_b'] = xr.DataArray(
+            mf_b_full[:, :, :, 0, :], dims=['time', 'z', 'y', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'insoluble mass fraction (Mode B) - west boundary'}
+        )
+        nc_output['ls_forcing_right_mass_fracs_b'] = xr.DataArray(
+            mf_b_full[:, :, :, -1, :], dims=['time', 'z', 'y', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'insoluble mass fraction (Mode B) - east boundary'}
+        )
+        
+        # South/North boundaries
+        nc_output['ls_forcing_south_mass_fracs_a'] = xr.DataArray(
+            mf_a_full[:, :, 0, :, :], dims=['time', 'z', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'soluble mass fraction (Mode A) - south boundary'}
+        )
+        nc_output['ls_forcing_north_mass_fracs_a'] = xr.DataArray(
+            mf_a_full[:, :, -1, :, :], dims=['time', 'z', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'soluble mass fraction (Mode A) - north boundary'}
+        )
+        nc_output['ls_forcing_south_mass_fracs_b'] = xr.DataArray(
+            mf_b_full[:, :, 0, :, :], dims=['time', 'z', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'insoluble mass fraction (Mode B) - south boundary'}
+        )
+        nc_output['ls_forcing_north_mass_fracs_b'] = xr.DataArray(
+            mf_b_full[:, :, -1, :, :], dims=['time', 'z', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'insoluble mass fraction (Mode B) - north boundary'}
+        )
+        
+        # Top boundary
+        nc_output['ls_forcing_top_mass_fracs_a'] = xr.DataArray(
+            mf_a_full[:, -1, :, :, :], dims=['time', 'y', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'soluble mass fraction (Mode A) - top boundary'}
+        )
+        nc_output['ls_forcing_top_mass_fracs_b'] = xr.DataArray(
+            mf_b_full[:, -1, :, :, :], dims=['time', 'y', 'x', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 
+                   'long_name': 'insoluble mass fraction (Mode B) - top boundary'}
+        )
+        print("  Added ls_forcing_*_mass_fracs_a/b(time, z, y/x, composition_index)")
+    
+    #-------------------------------------------------------------------------------
+    # Boundary conditions for size-resolved aerosol number concentration
+    #-------------------------------------------------------------------------------
+    
+    # Left/Right boundaries (west/east) - with Dmid dimension
+    nc_output['ls_forcing_left_aerosol'] = xr.DataArray(
+        palm_aerosol['aerosol_num'][:, :, :, 0, :].astype(np.float32), 
+        dims=['time', 'z', 'y', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 
+               'long_name': 'aerosol number concentration per bin - west boundary'}
+    )
+    nc_output['ls_forcing_right_aerosol'] = xr.DataArray(
+        palm_aerosol['aerosol_num'][:, :, :, -1, :].astype(np.float32), 
+        dims=['time', 'z', 'y', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1,'source': 'WRF-Chem', 
+               'long_name': 'aerosol number concentration per bin - east boundary'}
+    )
+    
+    # South/North boundaries - with Dmid dimension
+    nc_output['ls_forcing_south_aerosol'] = xr.DataArray(
+        palm_aerosol['aerosol_num'][:, :, 0, :, :].astype(np.float32), 
+        dims=['time', 'z', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1,'source': 'WRF-Chem', 
+               'long_name': 'aerosol number concentration per bin - south boundary'}
+    )
+    nc_output['ls_forcing_north_aerosol'] = xr.DataArray(
+        palm_aerosol['aerosol_num'][:, :, -1, :, :].astype(np.float32), 
+        dims=['time', 'z', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1,'source': 'WRF-Chem', 
+               'long_name': 'aerosol number concentration per bin - north boundary'}
+    )
+    
+    # Top boundary - with Dmid dimension
+    nc_output['ls_forcing_top_aerosol'] = xr.DataArray(
+        palm_aerosol['aerosol_num'][:, -1, :, :, :].astype(np.float32), 
+        dims=['time', 'y', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'lod': 1,'source': 'WRF-Chem', 
+               'long_name': 'aerosol number concentration per bin - top boundary'}
+    )
+    print("  Added ls_forcing_*_aerosol(time, z, y/x, Dmid) (#/m3)")
+
+    print("  All aerosol variables added to dataset")
+    print("="*60)
+
+    # After all xarray writes, fix composition_name using netCDF4 directly
+    try:
+        from netCDF4 import Dataset
+        import numpy as np
+        
+        # Open the file in append mode
+        nc_file = Dataset(nc_output_name, 'a')
+        
+        # Check if composition_name exists and has the string1 dimension
+        if 'composition_name' in nc_file.variables:
+            # Delete the existing variable (which has string1 dimension)
+            del nc_file.variables['composition_name']
+            
+            # Recreate it as a proper char array
+            comp_name_var = nc_file.createVariable(
+                'composition_name',
+                'S1',
+                ('composition_index', 'max_string_length'),
+                zlib=True
+            )
+            
+            # Copy attributes from the old variable if they existed
+            comp_name_var.long_name = 'aerosol species names'
+            comp_name_var.units = '-'
+            comp_name_var.standard_name = 'aerosol_species_name'
+            
+            # Create the character array
+            species_names = aerosol_processor.listspec
+            max_str_len = 25
+            
+            # Create the data array
+            char_data = np.zeros((len(species_names), max_str_len), dtype='S1')
+            for i, name in enumerate(species_names):
+                name_bytes = name.encode('utf-8')
+                name_len = min(len(name_bytes), max_str_len)
+                char_data[i, :name_len] = [bytes([b]) for b in name_bytes[:name_len]]
+                # Remaining positions are already zeros (null bytes)
+            
+            # Write the data
+            comp_name_var[:] = char_data
+            
+            print("  Successfully rewrote composition_name as proper char array without string1 dimension")
+        
+        nc_file.close()
+        
+    except Exception as e:
+        print(f"  Warning: Could not fix composition_name via netCDF4: {e}")
+        
+    #-------------------------------------------------------------------------------
+    #  max_string_length 
+    #-------------------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("FORCE ADDING max_string_length VARIABLE")
+    print("="*60)
+
+    try:
+        from netCDF4 import Dataset
+        import numpy as np
+        
+        # Open the file in append mode
+        nc_file = Dataset(nc_output_name, 'a')
+        
+        # Check if variable already exists
+        if 'max_string_length' not in nc_file.variables:
+            # Create the dimension if it doesn't exist
+            if 'max_string_length' not in nc_file.dimensions:
+                nc_file.createDimension('max_string_length', 25)
+                print("  Created dimension: max_string_length (size 25)")
+            
+            # Create the variable as float (f4)
+            max_str_var = nc_file.createVariable(
+                'max_string_length', 
+                'f4',  # 32-bit float
+                ('max_string_length',),
+                fill_value=-9999.0,
+                zlib=True
+            )
+            
+            # Add attributes
+            max_str_var.standard_name = ''
+            max_str_var.long_name = 'maximum string length'
+            
+            # Add data (1 to 25)
+            max_str_var[:] = np.arange(1, 26, dtype=np.float32)
+            
+            print("  Created variable: max_string_length")
+            print(f"  Data: {max_str_var[:]}")
+            print(f"  Attributes: standard_name='{max_str_var.standard_name}', long_name='{max_str_var.long_name}'")
+        else:
+            print("  Variable max_string_length already exists")
+            max_str_var = nc_file.variables['max_string_length']
+            print(f"  Existing data: {max_str_var[:]}")
+        
+        # Close the file
+        nc_file.close()
+        print("  Successfully wrote to file")
+        
+    except Exception as e:
+        print(f"  ERROR: {e}")
+
+    print("="*60)
+    # Final verification
+    print("\n" + "="*60)
+    print("VERIFYING OUTPUT VARIABLES")
+    print("="*60)
+    
+    # Check if max_string_length was written
+    import netCDF4
+    with netCDF4.Dataset(nc_output_name, 'r') as nc_check:
+        if 'max_string_length' in nc_check.variables:
+            max_str_var = nc_check.variables['max_string_length']
+            print(f"max_string_length CONFIRMED in output file")
+            print(f"  - Dimension: {max_str_var.dimensions}")
+            print(f"  - Shape: {max_str_var.shape}")
+            print(f"  - Values: {max_str_var[:]}")
+            print(f"  - Attributes: standard_name='{max_str_var.standard_name}', long_name='{max_str_var.long_name}'")
+        else:
+            print(" ERROR: max_string_length STILL NOT FOUND in output file!")
+            print(f"  Variables in file: {list(nc_check.variables.keys())}")
+
+#-------------------------------------------------------------------------------
 # Add radiation data to output
 #-------------------------------------------------------------------------------
 if len(rad_times_sec) > 0 and len(rad_values_proc[0]) > 0:
@@ -1387,10 +1878,19 @@ if len(rad_times_sec) > 0 and len(rad_values_proc[0]) > 0:
 else:
     print("No radiation data to add to output file")
 
-for var in nc_output.data_vars:
+'''for var in nc_output.data_vars:
     encoding = {var: {'dtype': 'float32', '_FillValue': -9999, 'zlib':True}}
+    nc_output[var].to_netcdf(nc_output_name, encoding=encoding, mode='a')'''
+# Write all variables with appropriate encoding
+for var in nc_output.data_vars:
+    if var == "composition_name":
+        # Special encoding for character array
+        encoding = {var: {'dtype': 'S1', 'zlib': True, '_FillValue': None}}
+    else:
+        # Default encoding for float variables
+        encoding = {var: {'dtype': 'float32', '_FillValue': -9999.0, 'zlib': True}}
+    
     nc_output[var].to_netcdf(nc_output_name, encoding=encoding, mode='a')
-
 
 print('Add to your *_p3d file: ' + '\n soil_temperature = ' +
               str([value for value in init_tsoil.mean(axis=(1,2))]) +
