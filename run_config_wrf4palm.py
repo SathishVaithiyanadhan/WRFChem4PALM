@@ -1903,6 +1903,94 @@ with open('cfg_files/'+ case_name + '.cfg', "a") as cfg:
       '\n soil_moisture = ' + str([value for value in init_msoil.mean(axis=(1,2))])
         + '\n deep_soil_temperature = ' + str(deep_tsoil)+'\n')
 
+import netCDF4 as nc
+
+# Use the same output file name
+input_file = nc_output_name
+output_file = nc_output_name  # Save with the same name (overwrite)
+
+try:
+    # Open the original file
+    with nc.Dataset(input_file, 'r') as src:
+        # Create a new file (temporarily)
+        temp_file = input_file + '.tmp'
+        with nc.Dataset(temp_file, 'w', format='NETCDF4') as dst:
+            # Copy dimensions, but exclude string1
+            for dim_name, dim in src.dimensions.items():
+                if dim_name != 'string1':
+                    dst.createDimension(dim_name, len(dim) if not dim.isunlimited() else None)
+            
+            # Copy global attributes
+            for attr_name in src.ncattrs():
+                dst.setncattr(attr_name, src.getncattr(attr_name))
+            
+            # Copy all variables except composition_name (we'll handle it separately)
+            for var_name, var in src.variables.items():
+                if var_name != 'composition_name':
+                    # Check if this variable has string1 in its dimensions
+                    dims = [d for d in var.dimensions if d != 'string1']
+                    
+                    # Get _FillValue if it exists to set during variable creation
+                    fill_value = None
+                    if '_FillValue' in var.ncattrs():
+                        fill_value = var.getncattr('_FillValue')
+                    
+                    # Create variable with appropriate fill_value
+                    new_var = dst.createVariable(var_name, var.datatype, dims, fill_value=fill_value)
+                    
+                    # Copy all attributes except _FillValue (already set)
+                    for attr_name in var.ncattrs():
+                        if attr_name != '_FillValue':
+                            new_var.setncattr(attr_name, var.getncattr(attr_name))
+                    
+                    # Copy data - handle special case for variables that had string1 dimension
+                    if 'string1' in var.dimensions:
+                        # This variable had string1 dimension, so we need to squeeze it out
+                        data = var[:]
+                        # If the string1 dimension is the last one with size 1, we can take the first element
+                        if data.shape[-1] == 1:
+                            data = data[..., 0]
+                        new_var[:] = data
+                    else:
+                        # Regular variable, copy as is
+                        new_var[:] = var[:]
+            
+            # Handle composition_name specially - remove string1 dimension
+            var = src.variables['composition_name']
+            
+            # Get _FillValue if it exists
+            fill_value = None
+            if '_FillValue' in var.ncattrs():
+                fill_value = var.getncattr('_FillValue')
+            
+            # Create new variable without string1 dimension
+            new_dims = ('composition_index', 'max_string_length')
+            new_var = dst.createVariable('composition_name', var.datatype, new_dims, fill_value=fill_value)
+            
+            # Copy all attributes except _FillValue
+            for attr_name in var.ncattrs():
+                if attr_name != '_FillValue':
+                    new_var.setncattr(attr_name, var.getncattr(attr_name))
+            
+            # Copy data - squeeze out the string1 dimension
+            data = var[:]  # Shape should be (7, 25, 1)
+            # Remove the last dimension (size 1)
+            data = data.reshape((data.shape[0], data.shape[1]))
+            new_var[:] = data
+    
+    # Replace the original file with the temp file
+    os.replace(temp_file, output_file)
+    print(f" Successfully post-processed: {output_file}")
+    print("   Removed string1 dimension from composition_name")
+    print("   composition_name now has dimensions: (composition_index, max_string_length)")
+    
+except Exception as e:
+    print(f" Error during post-processing: {e}")
+    # Clean up temp file if it exists
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+
+print("="*60)
 
 end = datetime.now()
 print('PALM dynamic input file is ready. Script duration: {}'.format(end - start))

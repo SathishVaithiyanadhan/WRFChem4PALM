@@ -1,21 +1,3 @@
-
-"""
-WRF-Chem Aerosol Processing Module for PALM Dynamic Driver
-
-This module handles conversion of WRF-Chem bin-resolved aerosols
-to PALM's two-mode aerosol representation with mass fractions and
-number concentrations, using SALSA-compatible bin structure.
-
-PALM aerosol variables:
-- init_atmosphere_aerosol, ls_forcing_*_aerosol: Size-resolved number concentration (#/m3) per bin
-- init_atmosphere_mass_fracs_a, ls_forcing_*_mass_fracs_a: Mass fraction of SOLUBLE components (-)
-- init_atmosphere_mass_fracs_b, ls_forcing_*_mass_fracs_b: Mass fraction of INSOLUBLE components (-)
-
-IMPORTANT: 
-    Mode A = SOLUBLE components (hygroscopic, CCN-active)
-    Mode B = INSOLUBLE components (hydrophobic, need aging)
-"""
-
 import numpy as np
 import xarray as xr
 from typing import Dict, List, Tuple, Optional, Union
@@ -24,16 +6,6 @@ import warnings
 class WRFChemAerosolProcessor:
     """
     Process WRF-Chem bin-resolved aerosols to PALM two-mode representation.
-    
-    SALSA (Sectional Aerosol module for Large Scale Applications) bin structure:
-        reglim = [d_min, d_split, d_max] in meters
-        nbin = [nbin1, nbin2] where:
-            nbin1 = number of bins in subrange 1 (d_min to d_split)
-            nbin2 = number of bins in subrange 2 (d_split to d_max)
-        
-    The bins are logarithmically spaced in two regimes:
-        Reglim 1: d_min to d_split (finer particles) with nbin1 bins
-        Reglim 2: d_split to d_max (coarser particles) with nbin2 bins
     """
     
     # Translation table mapping SALSA composition names to WRF-Chem variable prefixes
@@ -51,31 +23,30 @@ class WRFChemAerosolProcessor:
     # SOLUBLE species (hygroscopic, CCN-active)
     # These go to Mode A in PALM
     SOLUBLE_SPECIES = [
-        'so4',      # sulfate - highly soluble
-        'no3',      # nitrate - soluble
-        'nh4',      # ammonium - soluble
-        'na',       # sodium - soluble (sea salt)
-        'cl',       # chloride - soluble
-        'asoaX',    # aged anthropogenic SOA - soluble
-        'asoa1',    # aged anthropogenic SOA - soluble
-        'asoa2',    # aged anthropogenic SOA - soluble
-        'asoa3',    # aged anthropogenic SOA - soluble
-        'asoa4',    # aged anthropogenic SOA - soluble
-        'bsoaX',    # aged biogenic SOA - soluble
-        'bsoa1',    # aged biogenic SOA - soluble
-        'bsoa2',    # aged biogenic SOA - soluble
-        'bsoa3',    # aged biogenic SOA - soluble
-        'bsoa4',    # aged biogenic SOA - soluble
+        'so4',      
+        'no3',    
+        'nh4',      
+        'na',      
+        'cl',       
+        'asoaX',  
+        'asoa1',   
+        'asoa2',    
+        'asoa3',   
+        'asoa4',   
+        'bsoaX',   
+        'bsoa1',   
+        'bsoa2',   
+        'bsoa3',    
+        'bsoa4',    
     ]
     
     # INSOLUBLE species (hydrophobic, need aging)
-    # These go to Mode B in PALM
     INSOLUBLE_SPECIES = [
-        'bc',       # black carbon/elemental carbon - highly insoluble
-        'oin',      # other inorganics/mineral dust - insoluble
-        'ca',       # calcium (mineral dust) - insoluble
-        'co3',      # carbonate (mineral dust) - insoluble
-        'oc',       # organic carbon - fresh OC can be insoluble
+        'bc',       
+        'oin',      
+        'ca',      
+        'co3',      
+        'oc',     
     ]
     
     def __init__(self, 
@@ -480,6 +451,9 @@ class WRFChemAerosolProcessor:
         IMPORTANT: 
             Mode A = SOLUBLE components (hygroscopic, CCN-active)
             Mode B = INSOLUBLE components (hydrophobic, need aging)
+            
+        MODIFIED: All species in listspec are set as soluble (Mode A),
+                  Mode B (insoluble) remains zero.
         
         The output arrays use the original listspec order for composition_index.
         """
@@ -496,11 +470,10 @@ class WRFChemAerosolProcessor:
         
         # Initialize mass fraction arrays with listspec dimension
         mass_fracs_a = np.zeros((nz, ny, nx, n_species))  # SOLUBLE components
-        mass_fracs_b = np.zeros((nz, ny, nx, n_species))  # INSOLUBLE components
+        mass_fracs_b = np.zeros((nz, ny, nx, n_species))  # INSOLUBLE components (set to zero)
         
-        # Calculate total mass for soluble and insoluble modes
+        # Calculate total mass for soluble mode (all species contribute to Mode A)
         total_mass_soluble = np.zeros((nz, ny, nx))
-        total_mass_insoluble = np.zeros((nz, ny, nx))
         
         # Step 1: For each listspec species, find all WRF-Chem variables that map to it
         # and sum their masses
@@ -521,56 +494,21 @@ class WRFChemAerosolProcessor:
                     for bin_idx, mass_conc in aerosol_data['mass'][prefix].items():
                         species_total_mass[salsa_name] += mass_conc
         
-        # Step 2: Calculate total mass for soluble and insoluble modes
+        # Step 2: Calculate total mass for soluble mode (ALL species contribute)
         for sp_idx, salsa_name in enumerate(self.listspec):
             species_mass = species_total_mass[salsa_name]
-            
-            # Determine solubility for this SALSA species
-            if salsa_name == 'OC':
-                # OC is mixed - split based on solubility factor
-                total_mass_soluble += species_mass * self.oc_solubility_factor
-                total_mass_insoluble += species_mass * (1 - self.oc_solubility_factor)
-            elif salsa_name == 'SO4' or salsa_name == 'NO' or salsa_name == 'NH' or salsa_name == 'SS':
-                # Soluble species
-                total_mass_soluble += species_mass
-            elif salsa_name == 'BC' or salsa_name == 'DU':
-                # Insoluble species
-                total_mass_insoluble += species_mass
-            else:
-                # Unknown - default to insoluble
-                print(f"Warning: Species {salsa_name} not classified, defaulting to insoluble")
-                total_mass_insoluble += species_mass
+            total_mass_soluble += species_mass
         
         # Avoid division by zero
         total_mass_soluble = np.maximum(total_mass_soluble, 1e-30)
-        total_mass_insoluble = np.maximum(total_mass_insoluble, 1e-30)
         
-        # Step 3: Calculate mass fractions for each listspec species
+        # Step 3: Calculate mass fractions for each listspec species (all to Mode A)
         for sp_idx, salsa_name in enumerate(self.listspec):
             species_mass = species_total_mass[salsa_name]
             
-            if salsa_name == 'OC':
-                # Split OC between soluble and insoluble modes
-                soluble_part = species_mass * self.oc_solubility_factor
-                insoluble_part = species_mass * (1 - self.oc_solubility_factor)
-                
-                mass_fracs_a[:, :, :, sp_idx] = soluble_part / total_mass_soluble
-                mass_fracs_b[:, :, :, sp_idx] = insoluble_part / total_mass_insoluble
-                
-            elif salsa_name == 'SO4' or salsa_name == 'NO' or salsa_name == 'NH' or salsa_name == 'SS':
-                # All mass goes to soluble mode
-                mass_fracs_a[:, :, :, sp_idx] = species_mass / total_mass_soluble
-                # No contribution to insoluble mode
-                
-            elif salsa_name == 'BC' or salsa_name == 'DU':
-                # All mass goes to insoluble mode
-                mass_fracs_b[:, :, :, sp_idx] = species_mass / total_mass_insoluble
-                # No contribution to soluble mode
-                
-            else:
-                # Unknown - default to insoluble
-                print(f"Warning: Species {salsa_name} not classified, defaulting to insoluble")
-                mass_fracs_b[:, :, :, sp_idx] = species_mass / total_mass_insoluble
+            # ALL mass goes to soluble mode (Mode A)
+            mass_fracs_a[:, :, :, sp_idx] = species_mass / total_mass_soluble
+            # Mode B remains zero (no insoluble contribution)
         
         return mass_fracs_a, mass_fracs_b
     
@@ -839,7 +777,7 @@ def setup_aerosol_processing(config: Dict) -> Tuple[bool, Optional[WRFChemAeroso
     # Get OC solubility factor
     oc_solubility = config.get('oc_solubility_factor', 0.5)
     
-    # Initialize processor with SALSA parameters (all from config)
+    # Initialize processor with SALSA parameters
     processor = WRFChemAerosolProcessor(
         listspec=listspec,
         nbin=nbin,
