@@ -275,8 +275,8 @@ Development of WRFChem4PALM is based on WRF4PALM (https://github.com/dongqi-DQ/W
 A full documentation is still under construction, if you have any queries please contact the author or open a new issue.
 
 --------------------------------------------------------------------------------------------
-**Contact: 
-Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)
+**Contact:**
+**Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)**
 
-Sathish Kumar Vaithiyanadhan (sathishvaithiyanadhan@gmail.com) -- Chemistry, Radiation and Aerosol part**
+**Sathish Kumar Vaithiyanadhan (sathishvaithiyanadhan@gmail.com) -- Chemistry, Radiation and Aerosol part**
 
