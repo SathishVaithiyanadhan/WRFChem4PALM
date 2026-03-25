@@ -102,6 +102,7 @@ max_pool = 4,                # specify the maximum number of CPUs to use
 In the `domain` section, users need to provide PALM domain configuration (dx, dy, dz, nx, ny, nz, and z_origin), the latitude and longitude at PALM domain centre, and the projection of PALM domain. The projection of PALM domain and centre lat/lon are used to locate PALM domain in the WRF domain. The projection of PALM domain should be identical to the projection of PALM static driver, if the user has one. If users do not have the projection information, they can leave the field empty as `palm_proj = "",such that WRF4PALM v1.1 will use the projetion of WRF directly.
 
 
+```
 [domain]
 palm_proj = "EPSG:2193",    # projection of PALM
 centlat   = -35.7853,       # latitude of domain centre
@@ -113,18 +114,19 @@ dx        = 50.0,           # number of grid points along x-axis
 dy        = 50.0,           # number of grid points along y-axis
 dz        = 10.0,           # number of grid points along z-axis
 z_origin  = 508.0,            # elevated mean grid position (elevated terrain)
-
+```
 
 #### stretch
 In the `stretch` section, users can define vertically stretched grid spacing. The parameters are identical to those in PALM. If no stretching is required, leave dz_stretch_factor=1.0,
 
+```
 [stretch]
 dz_stretch_factor = 1.0,        # stretch factor for a vertically stretched grid
                                 # set this to 1.0 if no stretching required
 dz_stretch_level = 1200.0,      # Height level above which the grid is to be stretched vertically (in m)
 
 dz_max = 30.0,                  # allowed maximum vertical grid spacing (in m)
-
+```
 
 #### wrf
 WRF4PALM users must provide their own WRF output. Users must specify the directory (`wrf_path`) to access WRF netcdf output files, and WRF output filenames. WRF4PALM v1.1 allows users to provide one or multiple WRF files. Users can either provide a list of filenames, e.g.:  
