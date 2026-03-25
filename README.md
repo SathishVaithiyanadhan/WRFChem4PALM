@@ -92,11 +92,11 @@ conda activate wrf4palm
 #### case
 In the `case` section, users need to provide their case name and the maximum number of CPUs they want to use in WRF4PALM (here the number is 4).
 
-
+```
 [case]
 case_name = "wrf4palm_test", # specify your case name here
 max_pool = 4,                # specify the maximum number of CPUs to use
-
+```
 
 #### domain
 In the `domain` section, users need to provide PALM domain configuration (dx, dy, dz, nx, ny, nz, and z_origin), the latitude and longitude at PALM domain centre, and the projection of PALM domain. The projection of PALM domain and centre lat/lon are used to locate PALM domain in the WRF domain. The projection of PALM domain should be identical to the projection of PALM static driver, if the user has one. If users do not have the projection information, they can leave the field empty as `palm_proj = "",such that WRF4PALM v1.1 will use the projetion of WRF directly.
