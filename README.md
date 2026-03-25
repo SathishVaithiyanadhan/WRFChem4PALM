@@ -276,7 +276,7 @@ A full documentation is still under construction, if you have any queries please
 
 --------------------------------------------------------------------------------------------
 **Contact:**
-**Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)**
+**Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz) - Meteorology part**
 
 **Sathish Kumar Vaithiyanadhan (sathishvaithiyanadhan@gmail.com) -- Chemistry, Radiation and Aerosol part**
 
