@@ -1,31 +1,93 @@
-# WRFChem4PALM 
+# WRFChem4PALM
+
+WRFChem4PALM is an extension of WRF4PALM that handles meteorology, radiation, chemistry, and aerosols for generating PALM dynamic driver files from WRF-Chem output. This tool processes WRF-Chem data to create boundary conditions, initial profiles, and time-dependent forcing for PALM large-eddy simulations.
 
 
-Its the extension tool of WRF4PALM. The tool WRFChem4PALM handles Meteorology, Chemistry and Aerosols. 
+## What's New
 
-## What's new in v1.1?
-- multiple WRF output files are allowed
-- move from wrf-python to salem to modify RAM usage and computation time
-- use xarray instead of netCDF4 package to modify RAM usage and computation time
-- apply multiprocessing to improve computation time
-- users now only need to edit namelist instead of editing the script  
-- add surface variables (e.g. U10, V10, T2, and Q2) for surface NaN solver
-- read WRF projection info when locate PALM domain
-- allow users to specify the projection of PALM simulation
-- geostrophic winds are estimated using geopotential height instead of pressure
+### Version 2.0 (current)
+- **Aerosol Processing**: Full integration of SALSA aerosol scheme from Project B, enabling processing of up to 7 aerosol species with 8 size bins
+- **WRF-Chem Support**: Complete support for all WRF-Chem aerosol variables including mass concentrations and number distributions
+- **Translation Table**: Automatic mapping between PALM aerosol species and WRF-Chem variables (SO4→so4, OC→oc/asoa/bsoa, BC→bc, SS→cl/na, NH→nh4, NO→no3, DU→co3/ca/oin)
+- **Upwind Method**: Advanced upwind location method for initial aerosol profiles based on wind direction at each vertical level
+- **Multi-species Processing**: Ability to process up to 140+ chemistry and aerosol species simultaneously
+- **Enhanced Output**: Added aerosol-specific global attributes including bin sizes, reglim, species order, and nf2a factor
+- **Improved Metadata**: Comprehensive global attributes with author attribution and institution information
+- **Geostrophic Wind**: Support for geostrophic wind calculation from geopotential height (z) or pressure levels (p)
+- **Radiation Processing**: Full support for shortwave and longwave radiation data with spatial averaging
 
+### Version 1.1 (Previous)
+- Multiple WRF output files allowed (list or glob patterns)
+- Migration from wrf-python to salem for reduced RAM usage and faster computation
+- xarray implementation for improved memory management and lazy loading
+- Multiprocessing support to reduce computation time (configurable `max_pool`)
+- User-friendly namelist configuration instead of script editing
+- Surface variables (U10, V10, T2, Q2) for surface NaN solver
+- Automatic WRF projection detection for domain location
+- Geostrophic wind estimation using geopotential height
 
-### namelist
-In v1.1, users don't have to edit the main script, and only need to edit the namelist file to provide their input (for examples please see `namelist.wrf4palm`).
+## Features
 
-There are 6 sections in the namelist:
-- [case](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#case): users to provide case name and multiprocessing information
-- [domain](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#domain): PALM domain configuration
-- [stretch](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#stretch): if a vertically streched grid is used
-- [wrf](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#wrf): information about WRF output and start/end time in the dynamic driver
-- [soil](https://github.com/dongqi-DQ/WRF4PALM/tree/v1.1#soil): soil layers and dummy soil moisture information
-- [chemistry]: List of chemistry species required in the dynamic file
+### Meteorology
+- Wind components (U, V, W) at all grid points and boundaries
+- Potential temperature (PT) and water vapor mixing ratio (QVAPOR)
+- Surface pressure and 10m wind components
+- Soil temperature and moisture (multi-layer) with vertical interpolation
+- Vertical grid stretching support (dz_stretch_factor, dz_stretch_level, dz_max)
+- Support for both staggered and unstaggered grid coordinates
 
+### Chemistry
+- **Gas phase species**: NO, NO2, O3, HNO3, HO2, HO, NH3, SO2, CO, H2SO4 (sulf)
+- **Aggregated species**: 
+  - RH (reactive hydrocarbons) from 13 component species
+  - RO2 (peroxy radicals) from 15 component species
+  - RCHO (aldehydes) from 7 component species
+  - OCSV (semi-volatile organic compounds) from 6 component species
+  - OCNV (non-volatile organic compounds) from 4 component species
+- **Particulate matter**: PM10 and PM2.5 (converted from µg/m³ to kg/m³)
+- **Traffic emission support**: NO_traffic and NO2_traffic (copied from base species)
+
+### Aerosols (SALSA Scheme)
+- **Supported PALM species**: SO4 (sulfate), OC (organic carbon), BC (black carbon), SS (sea salt), NH (ammonium), NO (nitrate), DU (dust)
+- **Automatic mapping from WRF-Chem variables**:
+  - `SO4` → `so4_a01`, `so4_a02`, `so4_a03`, `so4_a04`
+  - `OC` → `oc_a01-04`, `asoaX_a01-04`, `asoa1-4_a01-04`, `bsoaX_a01-04`, `bsoa1-4_a01-04` (20+ variables)
+  - `BC` → `bc_a01-04`
+  - `SS` → `cl_a01-04`, `na_a01-04`
+  - `NH` → `nh4_a01-04`
+  - `NO` → `no3_a01-04`
+  - `DU` → `co3_a01-04`, `ca_a01-04`, `oin_a01-04`
+- **Bin structure**: Configurable subranges (default: 1 bin in first subrange, 7 bins in second = 8 total bins)
+- **Number concentration**: Full support for 4 WRF-Chem bins (`num_a01` through `num_a04`) with overlap ratio mapping
+- **Mass fractions**: Separate calculations for soluble (Mode A) and insoluble (Mode B) components
+- **Upwind initialization**: Initial profiles calculated using upwind location based on wind direction
+
+### Radiation
+- Shortwave incoming radiation (SWDOWN) - W/m²
+- Longwave incoming radiation (GLW) - W/m²
+- Diffuse shortwave radiation (SWDDIF) - W/m²
+- Spatial averaging over PALM domain with configurable smoothing distance
+- Time interpolation to match PALM simulation timesteps
+
+### Data Processing
+- Horizontal interpolation (linear or nearest) from WRF to PALM grid
+- Vertical interpolation of all variables to PALM vertical levels
+- Surface NaN resolution using logarithmic (wind) and linear (scalars) interpolation
+- Boundary condition extraction for all four lateral boundaries and top
+- Mass conservation adjustment for wind fields
+- Traffic variable handling (duplicate base species with suffix)
+
+## Installation
+
+### Conda Environment Setup
+```bash
+# Create the environment from the provided YAML file
+conda env create -f wrf4palm_env.yml
+
+# Activate the environment
+conda activate wrf4palm
+
+##### users don't have to edit the main script, and only need to edit the namelist file to provide their input (for examples please see namelist.wrf4palm).
 
 #### case
 In the `case` section, users need to provide their case name and the maximum number of CPUs they want to use in WRF4PALM (here the number is 4).
@@ -49,7 +111,7 @@ nz        = 120,            # number of grid points along z-axis
 dx        = 50.0,           # number of grid points along x-axis
 dy        = 50.0,           # number of grid points along y-axis
 dz        = 10.0,           # number of grid points along z-axis
-z_origin  = 0.0,            # elevated mean grid position (elevated terrain)
+z_origin  = 508.0,            # elevated mean grid position (elevated terrain)
 ```
 
 #### stretch
@@ -116,7 +178,28 @@ In the `chemistry` section, users need to config the initial and the boundary co
 species = ["PM10", "PM2_5_DRY"], # chemical species to include from WRF-Chem - "no", "no2", "o3", "PM10", "PM2_5_DRY"
 
 ```
+#### Radiation
+In the `radiation` section, users need to config the radiation from WRFChem 
 
+```
+[radiation] 
+radiation_from_wrf = True,
+radiation_smoothing_distance = 10000.0,  # Distance (in meters) around domain center to average radiation data
+
+```
+#### Aerosol
+In the `Aerosol` section, users need to config the initial and the boundary conditions for the aerosol and the mass fractions 
+
+```
+[aerosol]
+aerosol_wrfchem = True,                     # Enable aerosol processing
+listspec = ["SO4", "OC", "BC", "SS", "NH", "NO", "DU"],  # Aerosol chemical components
+nbin = [1, 7],                              # Number of bins in each subrange [bins in subrange 1, bins in subrange 2]
+reglim = [3.9e-8, 5.0e-8, 2.5e-6],         # Bin limits (m) [3.9e-8, 5.0e-8, 2.5e-6]   [2.5E-9, 1.5E-8, 1.0E-6] [3.0e-9, 1.0e-8, 2.5e-6] [d_min, d_split, d_max] in meters
+wrfchem_bin_limits = [3.9e-8, 1.56e-7, 6.25e-7, 2.5e-6, 1.0e-5],  # WRF-Chem bin limits
+nf2a = 1.0,    
+
+```
 ### One line command
 Once the namelist is ready, users can run WRF4PALM using the one line command:
 ```
@@ -124,93 +207,9 @@ python run_config_wrf4palm.py [your namelist]
 Eg. python run_config_wrf4palm.py  Augs_Bourges_Platz.wrf4palm
 ```
 
-**Execution example**
-```
-(wrf4palm) vaithisa@med-nb-0190:~/WRF4PALM_v1.1.2$  python run_config_wrf4palm.py  Augs_Bourges_Platz.wrf4palm
-Raw chemistry species: (['PM10', 'PM2_5_DRY'],), type: <class 'tuple'>
-Final chemistry species: ['PM10', 'PM2_5_DRY']
-Reading WRF
-cfg file is saved: Augs_Bourges_Platz
-Start horizontal interpolation
-Calculating soil temperature and moisture from WRF
-100%|█████████████████████████████████████████████████████████████████████████| 61/61 [00:01<00:00, 59.56it/s]
-Start vertical interpolation
-create empty datasets
-create empty datasets for staggered U and V (west&east boundaries)
-create empty datasets for staggered U and V (south&north boundaries)
-remove unused vars from datasets
-load dataset for west&east boundaries
-load dataset for south&north boundaries
-load dataset for west&east boundaries (staggered U)
-load dataset for south&north boundaries (staggered U)
-load dataset for west&east boundaries (staggered V)
-load dataset for south&north boundaries (staggered V)
-create datasets to save data in PALM coordinates
-create zeros arrays for vertical interpolation
-Processing QVAPOR for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 24.41it/s]
-Processing QVAPOR for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 22.58it/s]
-Processing pt for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.83it/s]
-Processing pt for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.94it/s]
-Processing chemistry species: ['PM10', 'PM2_5_DRY']
-Checking if PM10 exists in dataset...
-Processing PM10...
-Processing PM10 for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 26.15it/s]
-Processing PM10 for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.42it/s]
-Checking if PM2_5_DRY exists in dataset...
-Processing PM2_5_DRY...
-Processing PM2_5_DRY for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.51it/s]
-Processing PM2_5_DRY for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.38it/s]
-Processing W for west and east boundaries
-100%|█████████████████████████████████████████████████████████████████████████| 99/99 [00:04<00:00, 24.21it/s]
-Processing W for south and north boundaries
-100%|█████████████████████████████████████████████████████████████████████████| 99/99 [00:04<00:00, 21.75it/s]
-Processing U for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 24.76it/s]
-Processing U for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 21.35it/s]
-Processing V for west and east boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:04<00:00, 23.78it/s]
-Processing V for south and north boundaries
-100%|███████████████████████████████████████████████████████████████████████| 100/100 [00:03<00:00, 25.83it/s]
-Handling NaN values in chemistry boundary conditions...
-Checking for NaN values in PM10 boundary conditions...
-Found NaN values for PM10 in boundaries
-Filling remaining NaNs for PM10 in west/east with nearest values
-Completed NaN handling for PM10
-Checking for NaN values in PM2_5_DRY boundary conditions...
-Found NaN values for PM2_5_DRY in boundaries
-Filling remaining NaNs for PM2_5_DRY in west/east with nearest values
-Completed NaN handling for PM2_5_DRY
-Processing top boundary conditions...
-Processing top boundary datasets...
-100%|████████████████████████████████████████████████████████████████████████| 24/24 [00:00<00:00, 478.40it/s]
-Geostrophic wind estimation...
-Warning: geostr_lvl '' not recognized. Creating empty geostrophic wind dataset.
-Resolving surface NaNs...
-100%|███████████████████████████████████████████████████████████████████████████| 5/5 [00:09<00:00,  2.00s/it]
-Resolving surface NaNs...
-100%|███████████████████████████████████████████████████████████████████████████| 5/5 [00:09<00:00,  1.96s/it]
-Writing NetCDF file
-Add to your *_p3d file:
- soil_temperature = [275.1575803897265, 275.1575803897265, 275.1575803897265, 275.1575803897265, 275.59096211727683, 276.4171930245544, 277.2602839338403, 277.3071223549133]
- soil_moisture = [0.29050817773450777, 0.29050817773450777, 0.29050817773450777, 0.29050817773450777, 0.29221371136792584, 0.295842009108187, 0.30285884381862155, 0.3032486682790056]
- deep_soil_temperature = 281.09296
 
-PALM dynamic input file is ready. Script duration: 0:02:16.649943
-Start time: 2025-02-03T00:00:00.000000000
-End time: 2025-02-03T23:00:00.000000000
-Time step: 3600.0 seconds
-```
 
-If the execution is successful, the dynamic driver will be ready in `dynamic_files` with the `case_name` and start timestamp user specified. A cfg reference file will also be stored in `cfg_files` which contains domain configuration and soil temperatuer and moisture information. An example dynamic driver and an example cfg file are provided in `dynamic_files` and `cfg_files`, respectively.
+If the execution is successful, the dynamic driver will be ready in `dynamic_files` with the `case_name` and start timestamp user specified. A cfg reference file will also be stored in `cfg_files` which contains domain configuration and soil temperature and moisture information. An example dynamic driver and an example cfg file are provided in `dynamic_files` and `cfg_files`, respectively.
 
 ## Quick compare WRF & PALM
 
@@ -256,10 +255,10 @@ Note that the time series are horizontally averaged and hence the comparison onl
 
 ## Remark
 - [`Surface_NaN_Solver.pdf`](https://github.com/dongqi-DQ/WRF4PALM/blob/v1.1/Surface_NaN_Solver.pdf) provides a short documentation explaining how the surface nans are resolved.
-- The WRF4PALM v1.1 python environemnt is available in [`wrf4palm_env.yml`](https://github.com/dongqi-DQ/WRF4PALM/blob/v1.1/wrf4palm_env.yml).
+- The WRF4PALM v1.1 python environment is available in [`wrf4palm_env.yml`](https://github.com/dongqi-DQ/WRF4PALM/blob/v1.1/wrf4palm_env.yml).
 
 # Note  
-- We noticed that PALM uses a water temperature of 283 K as default, which may lead to a stable layer over water bodies (if there are any in the PALM simulation domain). We recommend users to modify the water temperatuer using the static driver.
+- We noticed that PALM uses a water temperature of 283 K as default, which may lead to a stable layer over water bodies (if there are any in the PALM simulation domain). We recommend users to modify the water temperature using the static driver.
 - We may release a static driver generator using global data set from Google earth engine and SST from ERA5 (date TBC).
 - Geostrophic winds are only an estimation while the accuracy of the estimation still needs further discussion and investigation. This problem is the same in INIFOR.
 - We encourage WRF4PALM users to use the GitHub **Issue** system if they encountered any issues or problems using WRF4PALM such that communications and trouble shooting will be easier.
@@ -268,11 +267,11 @@ Note that the time series are horizontally averaged and hence the comparison onl
 ### End of README
 --------------------------------------------------------------------------------------------
 
-Development of WRFChem4PALM is based on WRF4PALM (https://github.com/dongqi-DQ/WRF4PALM).
+Development of WRFChem4PALM is based on WRF4PALM (https://github.com/dongqi-DQ/WRF4PALM) with the additional Chemistry, Radiation and Aerosol features.
 
 A full documentation is still under construction, if you have any queries please contact the author or open a new issue.
 
 --------------------------------------------------------------------------------------------
 **Contact: Dongqi Lin (dongqi.lin@pg.canterbury.ac.nz)
-Sathish Kumar Vaithiyanadhan (sathish.vaithiyanadhan@med.uni-augsburg.de) -- Chemistry and aerosol part**
+Sathish Kumar Vaithiyanadhan (sathishvaithiyanadhan@gmail.com) -- Chemistry, Radiation and Aerosol part**
 
