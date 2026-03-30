@@ -75,10 +75,21 @@ def translate_aerosol_species(name):
 
 def define_bins(nbin, reglim):
     """
-    Define aerosol bins based on nbin and reglim
+    Define aerosol bins based on nbin and reglim.
+    
+    Parameters:
+    -----------
+    nbin : list
+        Number of bins in each subrange [n_subrange1, n_subrange2]
+    reglim : list
+        Bin limits [lower_limit, upper_limit_subrange1, upper_limit_subrange2]
+    
     Returns:
-        dmid: geometric mean diameters for each bin
-        bin_limits: bin boundary diameters
+    --------
+    dmid : numpy.ndarray
+        Geometric mean diameters for each bin
+    bin_limits : numpy.ndarray
+        Bin boundary diameters (including lower and upper limits)
     """
     nbins = np.sum(nbin)  # total number of bins
     vlolim = np.zeros(nbins)
@@ -114,10 +125,23 @@ def range_overlap(range1, range2):
 
 def aerosol_binoverlap(palm_binlim, wrfchem_binlim):
     """
-    Calculate overlap between PALM aerosol bins and WRF-Chem bins
+    Calculate overlap between PALM aerosol bins and WRF-Chem bins.
+    This is useful for more sophisticated bin mapping where you want to
+    preserve the size distribution from WRF-Chem.
+    
+    Parameters:
+    -----------
+    palm_binlim : numpy.ndarray
+        PALM bin boundary diameters (size nbins+1)
+    wrfchem_binlim : list
+        WRF-Chem bin boundary diameters (size 5 for standard scheme)
+    
     Returns:
-        aerobin_open: list of open bin names
-        overlap_ratio: overlap ratio matrix
+    --------
+    aerobin_open : list
+        List of open bin names (e.g., ['_a01', '_a02', ...])
+    overlap_ratio : numpy.ndarray
+        Overlap ratio matrix of shape (nbins, n_wrf_bins)
     """
     overlap_ratio = np.zeros((len(palm_binlim)-1, len(wrfchem_binlim)-1))
     aerobin_open = []
@@ -134,28 +158,71 @@ def aerosol_binoverlap(palm_binlim, wrfchem_binlim):
     
     return aerobin_open, overlap_ratio
 
-def upwind_location(zlev, u, v):
+def map_wrfchem_to_palm_bins(palm_binlim, wrfchem_binlim, method='overlap'):
     """
-    Determine upwind location for initial aerosol profiles
-    Based on wind direction
+    Map WRF-Chem bins to PALM bins using specified method.
+    
+    Parameters:
+    -----------
+    palm_binlim : numpy.ndarray
+        PALM bin boundary diameters
+    wrfchem_binlim : list
+        WRF-Chem bin boundary diameters
+    method : str
+        'simplified' - equal weight from all bins
+        'overlap' - size-based overlap weighting
+    
+    Returns:
+    --------
+    mapping_weights : numpy.ndarray
+        Weight matrix of shape (nbins_palm, nbins_wrf)
     """
-    u_wnd = u[0, zlev, :, :]
-    v_wnd = v[0, zlev, :, :]
+    nbins_palm = len(palm_binlim) - 1
+    nbins_wrf = len(wrfchem_binlim) - 1
+    mapping_weights = np.zeros((nbins_palm, nbins_wrf))
     
-    wnd_dir = np.mod(180 + np.rad2deg(np.arctan2(u_wnd, v_wnd)), 360)
-    wnd_avg = np.mean(wnd_dir)
+    if method == 'simplified':
+        # Equal contribution from all WRF-Chem bins
+        mapping_weights = np.ones((nbins_palm, nbins_wrf)) / nbins_wrf
+        
+    elif method == 'overlap':
+        # Size-based overlap weighting
+        # Calculate bin centers for reference
+        palm_centers = []
+        for i in range(nbins_palm):
+            palm_centers.append(np.sqrt(palm_binlim[i] * palm_binlim[i+1]))
+        
+        wrf_centers = []
+        for i in range(nbins_wrf):
+            wrf_centers.append(np.sqrt(wrfchem_binlim[i] * wrfchem_binlim[i+1]))
+        
+        # Calculate overlap weights based on geometric overlap
+        for pbin in range(nbins_palm):
+            p_low = palm_binlim[pbin]
+            p_high = palm_binlim[pbin+1]
+            
+            total_weight = 0
+            for wbin in range(nbins_wrf):
+                w_low = wrfchem_binlim[wbin]
+                w_high = wrfchem_binlim[wbin+1]
+                
+                # Calculate overlap in log space (more appropriate for aerosols)
+                overlap_low = max(p_low, w_low)
+                overlap_high = min(p_high, w_high)
+                
+                if overlap_low < overlap_high:
+                    # Weighted by overlap width in log space
+                    overlap_width = np.log(overlap_high / overlap_low)
+                    wrf_width = np.log(w_high / w_low)
+                    weight = overlap_width / wrf_width
+                    mapping_weights[pbin, wbin] = weight
+                    total_weight += weight
+            
+            # Normalize to ensure mass conservation
+            if total_weight > 0:
+                mapping_weights[pbin, :] /= total_weight
+            else:
+                # Fallback to simplified if no overlap
+                mapping_weights[pbin, :] = 1.0 / nbins_wrf
     
-    if 0 < wnd_avg <= 45 or 315 < wnd_avg <= 360:
-        prf_y = 0
-        prf_x = round(wnd_dir.shape[1] / 2)
-    elif 45 < wnd_avg <= 135:
-        prf_y = round(wnd_dir.shape[0] / 2)
-        prf_x = round(wnd_dir.shape[1] - 1)
-    elif 135 < wnd_avg <= 225:
-        prf_y = wnd_dir.shape[0] - 1
-        prf_x = round(wnd_dir.shape[1] / 2)
-    else:
-        prf_y = round(wnd_dir.shape[0] / 2)
-        prf_x = 0
-    
-    return prf_x, prf_y
+    return mapping_weights
