@@ -1,77 +1,120 @@
-
-###same method for chemsitry, meteorology and aerosols.
-# Aerosol, Meteorology, chemistry and radiation
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+WRF4PALM - COMPLETE VECTORIZED VERSION
+Fully optimized for memory efficiency and speed with aerosol support
+EXTENDED: Trace metals (Pb, Hg, Ni, Cd, As) with LU-INDEX-based classification
+"""
+
 import sys
 import os
 import time
+import gc
+import warnings
+import numpy as np
+from datetime import datetime, timedelta
+from functools import partial
+from glob import glob
+from math import floor, ceil
+
+# ===== MEMORY OPTIMIZATION: Set float32 as default =====
+np.float_ = np.float32
+np.set_printoptions(precision=4)
+
+# ===== PREVENT SALEM DOWNLOADS =====
+os.environ['SALEM_DOWNLOAD_DEMO_FILES'] = 'False'
+os.environ['SALEM_OFFLINE_MODE'] = 'True'
+
+# ===== IMPORTS =====
 import salem
 import xarray as xr
-from functools import partial
-from pyproj import Proj, Transformer
 import configparser
 import ast
-from glob import glob
-import numpy as np
-from math import ceil, floor
-from datetime import datetime, timedelta
 from tqdm import tqdm
 from multiprocess import Pool
+from pyproj import Proj, Transformer
+
+# Import from utility files
 from dynamic_util.nearest import framing_2d_cartesian
 from dynamic_util.loc_dom import calc_stretch, domain_location, generate_cfg
-from dynamic_util.process_wrf import zinterp, multi_zinterp
-from dynamic_util.geostrophic import *
-from dynamic_util.surface_nan_solver import *
-from dynamic_util.wrfchem_aerosol import (
-    AEROSOL_TRANSLATION, WRFCHEM_BIN_SUFFIXES,
-    get_wrfchem_variables_for_species, get_all_wrfchem_variables,
-    define_bins, aerosol_binoverlap
-)
-import warnings
-## suppress warnings
+from dynamic_util.process_wrf import multi_zinterp
+from dynamic_util.geostrophic import calc_geostrophic_wind_zlevels, calc_geostrophic_wind_plevels
+from dynamic_util.surface_nan_solver import solve_surface, surface_nan_uv, surface_nan_s, surface_nan_w
+from dynamic_util.interp_array import interp_array_2d, interp_array_1d
+
+# Import from wrfchem_aerosol (with vectorized functions)
+from dynamic_util.wrfchem_aerosol import *
+from dynamic_util.LU_classifier import *
+
+# Suppress warnings
 warnings.filterwarnings("ignore", '.*pyproj.*')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-#-------------------------------------------------------------------------------
-# Function to setup traffic variables
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Helper Functions
+#===============================================================================
+
 def setup_traffic_variables(chem_species):
-    """
-    Check if traffic variables are requested and set up the mapping
-    Returns: tuple (has_traffic, traffic_mapping)
-    """
+    """Check if traffic variables are requested"""
     traffic_mapping = {}
     has_traffic = False
     
     for species in chem_species:
         if species.endswith('_traffic'):
             base_species = species.replace('_traffic', '')
-            if base_species in ['no', 'no2']:
+            if base_species in ['no', 'no2', 'PM10', 'PM2_5_DRY']:
                 traffic_mapping[base_species] = species
                 has_traffic = True
-                print(f"Traffic variable requested: {species} (based on {base_species})")
+                print(f"Traffic variable requested: {species}")
     
     return has_traffic, traffic_mapping
 
+def print_memory_usage(stage=""):
+    """Optional memory debugging"""
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info().rss / 1024 / 1024 / 1024
+        print(f"[Memory] {stage}: {mem:.2f} GB")
+    except:
+        pass
+
+def aggregate_species_vectorized(chem_dict, components, target_species):
+    """Vectorized aggregation of component species"""
+    result = None
+    for comp in components:
+        if comp in chem_dict:
+            if result is None:
+                result = chem_dict[comp].copy()
+            else:
+                result = result + chem_dict[comp]
+    if result is not None:
+        chem_dict[target_species] = result
+    return chem_dict
+
+
+#===============================================================================
+# Main Execution
+#===============================================================================
+
 start = datetime.now()
 
-if not os.path.exists("./cfg_files"):
-    print("cfg_files folder created")
-    os.makedirs("./cfg_files")
-if not os.path.exists("./dynamic_files"):    
-    print("dynamic_files folder created")
-    os.makedirs("./dynamic_files")
+# Create directories
+for dir_name in ["./cfg_files", "./dynamic_files"]:
+    if not os.path.exists(dir_name):
+        print(f"{dir_name} folder created")
+        os.makedirs(dir_name)
 
-#--------------------------------------------------------------------------------
-# Read user input namelist
-#--------------------------------------------------------------------------------
+# Read configuration
 config = configparser.RawConfigParser()
 config.read(sys.argv[1])
+
 case_name = ast.literal_eval(config.get("case", "case_name"))[0]
 max_pool = ast.literal_eval(config.get("case", "max_pool"))[0]
-geostr_lvl = ast.literal_eval(config.get("case", "geostrophic"))[0] 
+geostr_lvl = ast.literal_eval(config.get("case", "geostrophic"))[0]
 
-# Read chemistry species from config
+# Chemistry species
 chem_species_raw = ast.literal_eval(config.get("chemistry", "species"))
 print(f"Raw chemistry species: {chem_species_raw}")
 
@@ -87,18 +130,14 @@ else:
 
 print(f"Final chemistry species: {chem_species}")
 
-#-------------------------------------------------------------------------------
-# Check for traffic variables
-#-------------------------------------------------------------------------------
+# Traffic variables
 has_traffic_vars, traffic_mapping = setup_traffic_variables(chem_species)
 original_chem_species = chem_species.copy()
 chem_species_for_processing = [s for s in chem_species if not s.endswith('_traffic')]
 
 print(f"Chemistry species for processing: {chem_species_for_processing}")
 
-#-------------------------------------------------------------------------------
-# Read aerosol settings from config
-#-------------------------------------------------------------------------------
+# Aerosol settings
 aerosol_wrfchem = False
 listspec = []
 nbin = [1, 7]
@@ -126,7 +165,7 @@ if aerosol_wrfchem:
                 listspec = list(listspec_raw)
         else:
             listspec = [listspec_raw]
-        print(f"Aerosol composition list (SALSA): {listspec}")
+        print(f"Aerosol composition list: {listspec}")
     except:
         listspec = ['SO4', 'OC', 'BC', 'SS', 'NH', 'NO', 'DU']
     
@@ -177,7 +216,7 @@ if aerosol_wrfchem:
     except:
         pass
 
-# Read radiation settings
+# Radiation settings
 try:
     radiation_from_wrf = ast.literal_eval(config.get("radiation", "radiation_from_wrf"))[0]
 except:
@@ -190,14 +229,13 @@ except:
 
 print(f"Radiation from WRF: {radiation_from_wrf}")
 
-# Define component species for aggregated species
+# Component species for aggregation
 RH_components = ["isopr", "apin", "bpin", "limon", "bcary", "myrc", 
-                "benzene", "tol", "xylenes", "bigalk", "bigene", 
-                "c2h4", "c3h6"]
+                "benzene", "tol", "xylenes", "bigalk", "bigene", "c2h4", "c3h6"]
 
-RO2_components = ["ch3o2", "aco3", "mco3", "alko2", "aceto2",
-                 "eto2", "pro2", "po2", "terpo2", "terp2o2",
-                 "nterpo2", "isopao2", "isopbo2", "mdialo2", "dicarbo2"]
+RO2_components = ["ch3o2", "aco3", "mco3", "alko2", "aceto2", "eto2", "pro2", 
+                  "po2", "terpo2", "terp2o2", "nterpo2", "isopao2", "isopbo2", 
+                  "mdialo2", "dicarbo2"]
 
 RCHO_components = ["ald", "bzald", "glyald", "hydrald", "gly", "mgly", "hcho"]
 
@@ -205,7 +243,7 @@ OCSV_components = ["cvasoa2", "cvasoa3", "cvasoa4", "cvbsoa2", "cvbsoa3", "cvbso
 
 OCNV_components = ["cvasoaX", "cvasoa1", "cvbsoaX", "cvbsoa1"]
 
-# Create list of component species
+# Combine all species
 all_component_species = []
 if "RH" in chem_species:
     all_component_species.extend(RH_components)
@@ -220,26 +258,21 @@ if "OCNV" in chem_species:
 
 all_component_species = list(set(all_component_species))
 
-# Combine regular chemistry species with component species for processing
 all_chem_to_process = list(set(chem_species_for_processing + all_component_species))
 all_chem_to_process = [s for s in all_chem_to_process if s not in ["RH", "RO2", "RCHO", "OCSV", "OCNV"]]
 
-# Add aerosol variables to processing list if enabled
+# Aerosol variables
 aerosol_vars = []
 if aerosol_wrfchem:
-    # Get all WRF-Chem variable names for the species in listspec (mass concentrations)
     aerosol_mass_vars = get_all_wrfchem_variables(listspec)
-    # Add number concentration variables
     aerosol_num_vars = [f'num{bin_suffix}' for bin_suffix in WRFCHEM_BIN_SUFFIXES]
     aerosol_vars = aerosol_mass_vars + aerosol_num_vars
-    
     all_chem_to_process.extend(aerosol_vars)
-    
     print(f"Aerosol mass variables to process: {aerosol_mass_vars}")
     print(f"Aerosol number variables to process: {aerosol_num_vars}")
     print(f"Total aerosol variables: {len(aerosol_vars)}")
 
-print(f"All species to process: {all_chem_to_process}")
+print(f"Total species to process: {len(all_chem_to_process)}")
 
 # Domain parameters
 palm_proj_code = ast.literal_eval(config.get("domain", "palm_proj"))[0]
@@ -253,17 +286,18 @@ ny = ast.literal_eval(config.get("domain", "ny"))[0]
 nz = ast.literal_eval(config.get("domain", "nz"))[0]
 z_origin = ast.literal_eval(config.get("domain", "z_origin"))[0]
 
-y = np.arange(dy/2, dy*ny + dy/2, dy)
-x = np.arange(dx/2, dx*nx + dx/2, dx)
-z = np.arange(dz/2, dz*nz, dz)
+# Create coordinate arrays (float32)
+y = np.arange(dy/2, dy*ny + dy/2, dy, dtype=np.float32)
+x = np.arange(dx/2, dx*nx + dx/2, dx, dtype=np.float32)
+z = np.arange(dz/2, dz*nz, dz, dtype=np.float32)
 xu = x + np.gradient(x)/2
-xu = xu[:-1]
+xu = xu[:-1].astype(np.float32)
 yv = y + np.gradient(y)/2
-yv = yv[:-1]
+yv = yv[:-1].astype(np.float32)
 zw = z + np.gradient(z)/2
-zw = zw[:-1]
+zw = zw[:-1].astype(np.float32)
 
-# Stretch grid if needed
+# Stretch grid
 dz_stretch_factor = ast.literal_eval(config.get("stretch", "dz_stretch_factor"))[0]
 dz_stretch_level = ast.literal_eval(config.get("stretch", "dz_stretch_level"))[0]
 dz_max = ast.literal_eval(config.get("stretch", "dz_max"))[0]
@@ -274,7 +308,7 @@ if dz_stretch_factor > 1.0:
 z += z_origin
 zw += z_origin
 
-dz_soil = np.array(ast.literal_eval(config.get("soil", "dz_soil")))
+dz_soil = np.array(ast.literal_eval(config.get("soil", "dz_soil")), dtype=np.float32)
 msoil_val = np.array(ast.literal_eval(config.get("soil", "msoil")))[0]
 
 wrf_path = ast.literal_eval(config.get("wrf", "wrf_path"))[0]
@@ -292,10 +326,10 @@ end_day = ast.literal_eval(config.get("wrf", "end_day"))[0]
 end_hour = ast.literal_eval(config.get("wrf", "end_hour"))[0]
 dynamic_ts = ast.literal_eval(config.get("wrf", "dynamic_ts"))[0]
 
-#-------------------------------------------------------------------------------
-# Read WRF
-#-------------------------------------------------------------------------------
-print("Reading WRF")
+#===============================================================================
+# Read WRF Files
+#===============================================================================
+print("Reading WRF files...")
 if len(wrf_file) == 1:
     wrf_files = sorted(glob(wrf_path + wrf_file[0]))
 else:
@@ -307,13 +341,14 @@ with salem.open_mf_wrf_dataset(wrf_files) as ds_raw:
         ds_raw = ds_raw.isel(time=0)
         ds_raw = ds_raw.rename({"xtime": "time"})
     for variables in ds_raw.data_vars:
-        ds_wrf[variables] = ds_raw[variables].drop_duplicates("time", keep="last")
+        ds_wrf[variables] = ds_raw[variables].drop_duplicates("time", keep="last").astype(np.float32)
     ds_wrf.attrs = ds_raw.attrs
 del ds_raw
+gc.collect()
 
-#-------------------------------------------------------------------------------
-# Find timestamps
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Find Timestamps
+#===============================================================================
 dt_start = datetime(start_year, start_month, start_day, start_hour)
 dt_end = datetime(end_year, end_month, end_day, end_hour)
 
@@ -330,13 +365,13 @@ if floor(num_ts) != ceil(num_ts):
 all_ts = np.array(all_ts).astype("datetime64[ns]")
 ds_wrf = ds_wrf.sel(time=all_ts)
 
-times_sec = np.zeros(len(all_ts))
+times_sec = np.zeros(len(all_ts), dtype=np.float32)
 for t in range(0, len(all_ts)):
     times_sec[t] = (all_ts[t] - all_ts[0]).astype('float') * 1e-9
 
-#-------------------------------------------------------------------------------
-# Locate PALM domain in WRF
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Locate PALM Domain in WRF
+#===============================================================================
 map_proj = ds_wrf.MAP_PROJ
 wrf_map_dict = {1: "lcc", 2: "stere", 3: "merc", 6: "latlong"}
 
@@ -362,6 +397,20 @@ else:
     y0_wrf = -(ny_wrf - 1) / 2. * dy_wrf + n
     xx_wrf, yy_wrf = np.meshgrid(np.arange(nx_wrf) * dx_wrf + x0_wrf,
                                  np.arange(ny_wrf) * dy_wrf + y0_wrf)
+
+# Add debug output:
+print(f"\nFull WRF Projection Info:")
+print(f"  MAP_PROJ: {map_proj} ({wrf_map_dict[map_proj]})")
+print(f"  wrf_proj type: {type(wrf_proj)}")
+print(f"  wrf_proj definition: {wrf_proj.definition_string() if hasattr(wrf_proj, 'definition_string') else 'N/A'}")
+print(f"  TRUELAT1: {ds_wrf.TRUELAT1}")
+print(f"  TRUELAT2: {ds_wrf.TRUELAT2}")
+print(f"  MOAD_CEN_LAT: {ds_wrf.MOAD_CEN_LAT}")
+print(f"  STAND_LON: {ds_wrf.STAND_LON}")
+print(f"  CEN_LAT: {ds_wrf.CEN_LAT}")
+print(f"  CEN_LON: {ds_wrf.CEN_LON}")
+print(f"  DX, DY: {dx_wrf}, {dy_wrf}")
+print(f"  x0_wrf, y0_wrf: {x0_wrf:.1f}, {y0_wrf:.1f}")
 
 if len(palm_proj_code) == 0:
     palm_proj = wrf_proj
@@ -389,15 +438,35 @@ mask_sn = (ds_wrf.south_north >= ds_wrf.south_north[south_idx]) & (ds_wrf.south_
 mask_we = (ds_wrf.west_east >= ds_wrf.west_east[west_idx]) & (ds_wrf.west_east <= ds_wrf.west_east[east_idx])
 
 ds_drop = ds_wrf.where(mask_sn & mask_we, drop=True)
+
+# Print domain extraction summary
+print(f"  Requested center:  {centlat:.6f}°N, {centlon:.6f}°E")
+print(f"  WRF grid indices:  WE=[{west_idx}:{east_idx}], SN=[{south_idx}:{north_idx}]")
+print(f"  WRF cells extracted: {east_idx-west_idx+1} × {north_idx-south_idx+1}")
+print(f"  Extracted center: {centlat:.6f}°N, {centlon:.6f}°E")
+print("-"*40 + "\n")
+
 ds_drop["pt"] = ds_drop["T"] + 300
 ds_drop["pt"].attrs = ds_drop["T"].attrs
 ds_drop["gph"] = (ds_drop["PH"] + ds_drop["PHB"]) / 9.81
 ds_drop["gph"].attrs = ds_drop["PH"].attrs
 
-#-------------------------------------------------------------------------------
-# Horizontal interpolation
-#-------------------------------------------------------------------------------
-print("Start horizontal interpolation")
+#===============================================================================
+# PROCESSING HEADER
+#===============================================================================
+print("\n" + "="*80)
+print("WRF4PALM DYNAMIC DRIVER GENERATION")
+print("="*80)
+print(f"  Processing date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"  Case: {case_name}")
+print(f"  Period: {dt_start.strftime('%Y-%m-%d %H:%M')} to {dt_end.strftime('%Y-%m-%d %H:%M')} UTC ({len(all_ts)} timesteps)")
+print(f"  PALM domain: {nx}×{ny}×{nz}, {dx:.0f}m×{dy:.0f}m×{dz:.0f}m ({nx*dx:.0f}m × {ny*dy:.0f}m)")
+print("="*80 + "\n")
+
+#===============================================================================
+# Horizontal Interpolation (Vectorized via xarray)
+#===============================================================================
+print("Start horizontal interpolation...")
 south_north_palm = ds_drop.south_north[0].data + y
 west_east_palm = ds_drop.west_east[0].data + x
 south_north_v_palm = ds_drop.south_north[0].data + yv
@@ -408,6 +477,11 @@ ds_drop = ds_drop.assign_coords({"west_east_palm": west_east_palm,
                                  "west_east_u_palm": west_east_u_palm,
                                  "south_north_v_palm": south_north_v_palm})
 
+# Chunk for memory efficiency
+chunks = {"time": 1, "south_north": -1, "west_east": -1}
+ds_drop = ds_drop.chunk(chunks)
+
+# Vectorized interpolation
 ds_interp = ds_drop.interp({"west_east": ds_drop.west_east_palm}, method=interp_mode
                           ).interp({"south_north": ds_drop.south_north_palm}, method=interp_mode)
 ds_interp_u = ds_drop.interp({"west_east": ds_drop.west_east_u_palm}, method=interp_mode
@@ -422,34 +496,91 @@ ds_interp_u = ds_interp_u.drop(["west_east", "south_north"]).rename({"west_east_
 ds_interp_v = ds_interp_v.drop(["west_east", "south_north"]).rename({"west_east_palm": "west_east",
                                                                       "south_north_v_palm": "south_north"})
 
-# Get surface and soil fields
-zs_wrf = ds_interp.ZS[0, :, 0, 0].load()
-t2_wrf = ds_interp.T2.load()
-u10_wrf = ds_interp_u.U10.load()
-v10_wrf = ds_interp_v.V10.load()
-qv2_wrf = ds_interp.Q2.load()
-psfc_wrf = ds_interp.PSFC.load()
+# Convert to float32
+for var in ds_interp.data_vars:
+    ds_interp[var] = ds_interp[var].astype(np.float32)
+for var in ds_interp_u.data_vars:
+    ds_interp_u[var] = ds_interp_u[var].astype(np.float32)
+for var in ds_interp_v.data_vars:
+    ds_interp_v[var] = ds_interp_v[var].astype(np.float32)
+
+# ===== Handle LU_INDEX  with NEAREST neighbor =====
+# This MUST be done after the main interpolation to overwrite any averaged values
+if 'LU_INDEX' in ds_drop.data_vars:
+    print("\n  " + "-"*50)
+    print("  LU_INDEX INTERPOLATION (NEAREST NEIGHBOR)")
+    print("  " + "-"*50)
+    
+    # DEBUG: Check what's in the cropped WRF domain BEFORE interpolation
+    lu_cropped = ds_drop['LU_INDEX'].isel(time=0).values
+    print(f"\n  Cropped WRF LU_INDEX (before interpolation):")
+    print(f"    Shape: {lu_cropped.shape}")
+    print(f"    Unique values: {np.unique(lu_cropped)}")
+    print(f"    Urban (13) count: {np.sum(lu_cropped == 13)}")
+    print(f"    Full array:\n{lu_cropped}")
+    
+    # Use nearest neighbor for categorical land use data
+    ds_interp['LU_INDEX'] = ds_drop['LU_INDEX'].interp(
+        {"west_east": ds_drop.west_east_palm}, 
+        method='nearest'
+    ).interp(
+        {"south_north": ds_drop.south_north_palm}, 
+        method='nearest'
+    ).astype(np.int32)
+    
+    # DEBUG: Check what's in the interpolated LU_INDEX AFTER nearest-neighbor
+    lu_interp = ds_interp['LU_INDEX'].isel(time=0).values
+    print(f"\n  Interpolated LU_INDEX (after nearest-neighbor):")
+    print(f"    Shape: {lu_interp.shape}")
+    print(f"    Unique values: {np.unique(lu_interp)}")
+    print(f"    Urban (13) count: {np.sum(lu_interp == 13)}")
+    print(f"    Rural count: {np.sum(lu_interp != 13)}")
+    
+    # Show center 3x3 to verify urban cell is present
+    if lu_interp.shape[0] >= 3 and lu_interp.shape[1] >= 3:
+        cy, cx = lu_interp.shape[0]//2, lu_interp.shape[1]//2
+        print(f"\n    Center 3x3 values:")
+        print(lu_interp[cy-1:cy+2, cx-1:cx+2])
+    
+    # Check if urban was lost
+    if np.sum(lu_cropped == 13) > 0 and np.sum(lu_interp == 13) == 0:
+        print(f"\n  WARNING: Urban pixels present in WRF but LOST after interpolation!")
+        print(f"    This is the interpolation dilution problem.")
+        print(f"    Recommendation: Set force_urban = True for this domain.")
+    elif np.sum(lu_interp == 13) > 0:
+        urban_pct = np.sum(lu_interp == 13) / lu_interp.size * 100
+        print(f"\n  Urban pixels preserved! ({urban_pct:.1f}% of domain)")
+    
+    print("  " + "-"*50 + "\n")
+
+# Get surface fields
+zs_wrf = ds_interp.ZS[0, :, 0, 0].load().astype(np.float32)
+t2_wrf = ds_interp.T2.load().astype(np.float32)
+u10_wrf = ds_interp_u.U10.load().astype(np.float32)
+v10_wrf = ds_interp_v.V10.load().astype(np.float32)
+qv2_wrf = ds_interp.Q2.load().astype(np.float32)
+psfc_wrf = ds_interp.PSFC.load().astype(np.float32)
 pt2_wrf = t2_wrf * ((1000) / (psfc_wrf * 0.01)) ** 0.286
 
 surface_var_dict = {"U": u10_wrf, "V": v10_wrf, "pt": pt2_wrf, "QVAPOR": qv2_wrf, "W": None}
 
-#-------------------------------------------------------------------------------
-# Soil moisture and temperature
-#-------------------------------------------------------------------------------
-print("Calculating soil temperature and moisture from WRF")
+#===============================================================================
+# Soil Moisture and Temperature (Vectorized)
+#===============================================================================
+print("Calculating soil temperature and moisture from WRF...")
 
 watermask = ds_interp["LANDMASK"].sel(time=dt_start).load().data == 0
 landmask = ds_interp["LANDMASK"].sel(time=dt_start).load().data == 1
 median_smois = [np.nanmedian(ds_interp["SMOIS"][0, izs, :, :].load().data[landmask]) for izs in range(0, len(zs_wrf))]
 ds_interp["soil_layers"] = zs_wrf.load().data
-tslb_wrf = ds_interp["TSLB"].sel(time=dt_start).load()
-smois_wrf = ds_interp["SMOIS"].sel(time=dt_start).load()
-deep_soil_wrf = ds_interp["TMN"].sel(time=dt_start)
+tslb_wrf = ds_interp["TSLB"].sel(time=dt_start).load().astype(np.float32)
+smois_wrf = ds_interp["SMOIS"].sel(time=dt_start).load().astype(np.float32)
+deep_soil_wrf = ds_interp["TMN"].sel(time=dt_start).load().astype(np.float32)
 deep_tsoil = deep_soil_wrf.where(landmask).mean().load().data
 
 if np.isnan(median_smois[0]):
     print("Warning: Entire PALM domain over water surface.")
-    median_smois = np.ones_like(median_smois)
+    median_smois = np.ones_like(median_smois, dtype=np.float32)
     deep_tsoil = deep_soil_wrf.mean().load().data
 
 for izs in range(0, len(zs_wrf)):
@@ -457,27 +588,70 @@ for izs in range(0, len(zs_wrf)):
     if smois_wrf.isel(soil_layers=izs).mean() == 0.0:
         smois_wrf.isel(soil_layers=izs).data[:, :] = msoil_val
 
-zs_palm = np.zeros_like(dz_soil)
+zs_palm = np.zeros_like(dz_soil, dtype=np.float32)
 zs_palm[0] = dz_soil[0]
 for i in range(1, len(dz_soil)):
     zs_palm[i] = np.sum(dz_soil[:i+1])
 
-init_tsoil = np.zeros((len(dz_soil), len(y), len(x)))
-init_msoil = np.zeros((len(dz_soil), len(y), len(x)))
-for iy in tqdm(range(0, len(y)), position=0, leave=True):
+# Vectorized soil interpolation
+init_tsoil = np.zeros((len(dz_soil), len(y), len(x)), dtype=np.float32)
+init_msoil = np.zeros((len(dz_soil), len(y), len(x)), dtype=np.float32)
+
+for iy in tqdm(range(0, len(y)), desc="Soil interpolation", position=0, leave=True):
     for ix in range(0, len(x)):
         init_tsoil[:, iy, ix] = np.interp(zs_palm, zs_wrf.data, tslb_wrf[:, iy, ix])
         init_msoil[:, iy, ix] = np.interp(zs_palm, zs_wrf.data, smois_wrf[:, iy, ix])
 
-#-------------------------------------------------------------------------------
-# Vertical interpolation for boundaries
-#-------------------------------------------------------------------------------
-print("Start vertical interpolation")
-print("create empty datasets")
+#===============================================================================
+# STREET TYPE CLASSIFICATION (PIXEL-BY-PIXEL)
+#===============================================================================
+
+print("\n" + "="*60)
+print("STREET TYPE CLASSIFICATION")
+print("="*60)
+
+# Determine if we should force urban based on the debug output
+# If cropped WRF has urban but interpolated lost it, suggest force_urban
+force_urban = False
+if 'LU_INDEX' in ds_drop.data_vars and 'LU_INDEX' in ds_interp.data_vars:
+    lu_cropped = ds_drop['LU_INDEX'].isel(time=0).values
+    lu_interp = ds_interp['LU_INDEX'].isel(time=0).values
+    if np.sum(lu_cropped == 13) > 0 and np.sum(lu_interp == 13) == 0:
+        print("\n  ⚠ WARNING: Urban pixels present in WRF but lost during interpolation!")
+        print("    This domain spans multiple WRF cells, and the urban signal was diluted.")
+        print("    Consider setting force_urban = True for accurate urban classification.")
+        # force_urban = True  # Uncomment to auto-force
+
+# Classify pixel-by-pixel using the nearest-neighbor interpolated LU_INDEX
+street_classification = classify_street_types_pixel_by_pixel(
+    ds_interp=ds_interp,
+    nx=nx,
+    ny=ny,
+    force_urban=force_urban
+)
+
+street_type_surface = street_classification['street_type_surface']
+street_type_we = street_classification['street_type_we']
+street_type_sn = street_classification['street_type_sn']
+stats = street_classification['stats']
+
+print("\n" + "="*60)
+print("STREET TYPE CLASSIFICATION COMPLETE")
+print("="*60)
+print(f"  Urban pixels: {stats['urban_pixels']} ({stats['urban_pct']:.1f}%)")
+print(f"  Rural pixels: {stats['rural_pixels']} ({stats['rural_pct']:.1f}%)")
+print("="*60)
+
+#===============================================================================
+# Vertical Interpolation - FULLY VECTORIZED AND MEMORY EFFICIENT
+#===============================================================================
+print("\n" + "="*60)
+print("Start vertical interpolation (vectorized, memory-efficient)")
+print("="*60)
+
+# Create boundary datasets (lazy loading - no .load()!)
 ds_we = ds_interp.isel(west_east=[0, -1])
 ds_sn = ds_interp.isel(south_north=[0, -1])
-
-print("create empty datasets for staggered U and V")
 ds_we_ustag = ds_interp_u.isel(west_east=[0, -1])
 ds_we_vstag = ds_interp_v.isel(west_east=[0, -1])
 ds_sn_ustag = ds_interp_u.isel(south_north=[0, -1])
@@ -486,7 +660,7 @@ ds_sn_vstag = ds_interp_v.isel(south_north=[0, -1])
 varbc_list = ["W", "QVAPOR", "pt", "Z"]
 varbc_list.extend(all_chem_to_process)
 
-print("remove unused vars from datasets")
+# Remove unused variables
 for var in list(ds_we.data_vars):
     if var not in varbc_list:
         ds_we = ds_we.drop(var)
@@ -498,15 +672,7 @@ for var in list(ds_we.data_vars):
         ds_we_vstag = ds_we_vstag.drop(var)
         ds_sn_vstag = ds_sn_vstag.drop(var)
 
-print("load datasets")
-ds_we = ds_we.load()
-ds_sn = ds_sn.load()
-ds_we_ustag = ds_we_ustag.load()
-ds_sn_ustag = ds_sn_ustag.load()
-ds_we_vstag = ds_we_vstag.load()
-ds_sn_vstag = ds_sn_vstag.load()
-
-print("create datasets to save data in PALM coordinates")
+# Create output datasets
 ds_palm_we = xr.Dataset()
 ds_palm_we = ds_palm_we.assign_coords({"x": x[:2], "y": y, "time": ds_interp.time.data,
                                        "z": z, "yv": yv, "xu": xu[:2], "zw": zw})
@@ -514,77 +680,79 @@ ds_palm_sn = xr.Dataset()
 ds_palm_sn = ds_palm_sn.assign_coords({"x": x, "y": y[:2], "time": ds_interp.time.data,
                                        "z": z, "yv": yv[:2], "xu": xu, "zw": zw})
 
-print("create zeros arrays for vertical interpolation")
-zeros_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])))
-zeros_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)))
+# Process meteorological variables ONE AT A TIME
+met_vars = ["QVAPOR", "pt"]
 
-# Interpolation scalars
-for varbc in ["QVAPOR", "pt"]:
-    ds_palm_we[varbc] = xr.DataArray(np.copy(zeros_we), dims=['time', 'z', 'y', 'x'])
-    ds_palm_sn[varbc] = xr.DataArray(np.copy(zeros_sn), dims=['time', 'z', 'y', 'x'])
-    print(f"Processing {varbc} for boundaries")
+for varbc in met_vars:
+    print(f"Processing {varbc} for boundaries...")
+    
+    zeros_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    zeros_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    
+    ds_palm_we[varbc] = xr.DataArray(zeros_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn[varbc] = xr.DataArray(zeros_sn, dims=['time', 'z', 'y', 'x'])
+    
     ds_palm_we[varbc] = multi_zinterp(max_pool, ds_we, varbc, z, ds_palm_we)
     ds_palm_sn[varbc] = multi_zinterp(max_pool, ds_sn, varbc, z, ds_palm_sn)
+    
+    del zeros_we, zeros_sn
+    gc.collect()
 
-# Vertical interpolation for chemistry and aerosol species
-print(f"Processing all species: {all_chem_to_process}")
+# Process chemistry species ONE AT A TIME 
+print(f"\nProcessing {len(all_chem_to_process)} chemistry species...")
 
-# Pre-filter to only available species
 available_species = [s for s in all_chem_to_process if s in list(ds_we.data_vars.keys())]
-print(f"Available species for processing: {available_species}")
+print(f"Available species: {len(available_species)}")
 
-def process_species_batch(species_batch, ds_we, ds_sn, z, max_pool, ds_palm_we, ds_palm_sn):
-    for species in species_batch:
-        print(f"Processing {species}...")
-        chem_dims = ds_we[species].shape
-        chem_zeros_we = np.zeros((chem_dims[0], len(z), len(y), len(x[:2])))
-        chem_zeros_sn = np.zeros((chem_dims[0], len(z), len(y[:2]), len(x)))
-        
-        ds_palm_we[species] = xr.DataArray(np.copy(chem_zeros_we), dims=['time', 'z', 'y', 'x'])
-        ds_palm_sn[species] = xr.DataArray(np.copy(chem_zeros_sn), dims=['time', 'z', 'y', 'x'])
-        
-        ds_palm_we[species] = multi_zinterp(max_pool, ds_we, species, z, ds_palm_we)
-        ds_palm_sn[species] = multi_zinterp(max_pool, ds_sn, species, z, ds_palm_sn)
+for i, species in enumerate(tqdm(available_species, desc="Chemistry species")):
+    print(f"  [{i+1}/{len(available_species)}] {species}")
+    
+    chem_zeros_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    chem_zeros_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    
+    ds_palm_we[species] = xr.DataArray(chem_zeros_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn[species] = xr.DataArray(chem_zeros_sn, dims=['time', 'z', 'y', 'x'])
+    
+    ds_palm_we[species] = multi_zinterp(max_pool, ds_we, species, z, ds_palm_we)
+    ds_palm_sn[species] = multi_zinterp(max_pool, ds_sn, species, z, ds_palm_sn)
+    
+    del chem_zeros_we, chem_zeros_sn
+    gc.collect()
 
-batch_size = 10
-for i in range(0, len(available_species), batch_size):
-    batch = available_species[i:i + batch_size]
-    process_species_batch(batch, ds_we, ds_sn, z, max_pool, ds_palm_we, ds_palm_sn)
-
-# Process W for boundaries
-zeros_we_w = np.zeros((len(all_ts), len(zw), len(y), len(x[:2])))
-zeros_sn_w = np.zeros((len(all_ts), len(zw), len(y[:2]), len(x)))
-ds_palm_we["W"] = xr.DataArray(np.copy(zeros_we_w), dims=['time', 'zw', 'y', 'x'])
-ds_palm_sn["W"] = xr.DataArray(np.copy(zeros_sn_w), dims=['time', 'zw', 'y', 'x'])
-
-print("Processing W for boundaries")
+# Process W (vertical wind)
+print("Processing W for boundaries...")
+zeros_we_w = np.zeros((len(all_ts), len(zw), len(y), len(x[:2])), dtype=np.float32)
+zeros_sn_w = np.zeros((len(all_ts), len(zw), len(y[:2]), len(x)), dtype=np.float32)
+ds_palm_we["W"] = xr.DataArray(zeros_we_w, dims=['time', 'zw', 'y', 'x'])
+ds_palm_sn["W"] = xr.DataArray(zeros_sn_w, dims=['time', 'zw', 'y', 'x'])
 ds_palm_we["W"] = multi_zinterp(max_pool, ds_we, "W", zw, ds_palm_we)
 ds_palm_sn["W"] = multi_zinterp(max_pool, ds_sn, "W", zw, ds_palm_sn)
+del zeros_we_w, zeros_sn_w
+gc.collect()
 
-# Process U and V
-zeros_we_u = np.zeros((len(all_ts), len(z), len(y), len(xu[:2])))
-zeros_sn_u = np.zeros((len(all_ts), len(z), len(y[:2]), len(xu)))
-ds_palm_we["U"] = xr.DataArray(np.copy(zeros_we_u), dims=['time', 'z', 'y', 'xu'])
-print("Processing U for boundaries")
+# Process U
+print("Processing U for boundaries...")
+zeros_we_u = np.zeros((len(all_ts), len(z), len(y), len(xu[:2])), dtype=np.float32)
+zeros_sn_u = np.zeros((len(all_ts), len(z), len(y[:2]), len(xu)), dtype=np.float32)
+ds_palm_we["U"] = xr.DataArray(zeros_we_u, dims=['time', 'z', 'y', 'xu'])
 ds_palm_we["U"] = multi_zinterp(max_pool, ds_we_ustag, "U", z, ds_palm_we)
-
-ds_palm_sn["U"] = xr.DataArray(np.copy(zeros_sn_u), dims=['time', 'z', 'y', 'xu'])
-print("Processing U for south/north")
+ds_palm_sn["U"] = xr.DataArray(zeros_sn_u, dims=['time', 'z', 'y', 'xu'])
 ds_palm_sn["U"] = multi_zinterp(max_pool, ds_sn_ustag, "U", z, ds_palm_sn)
+del zeros_we_u, zeros_sn_u
+gc.collect()
 
-zeros_we_v = np.zeros((len(all_ts), len(z), len(yv), len(x[:2])))
-zeros_sn_v = np.zeros((len(all_ts), len(z), len(yv[:2]), len(x)))
-ds_palm_we["V"] = xr.DataArray(np.copy(zeros_we_v), dims=['time', 'z', 'yv', 'x'])
-print("Processing V for west/east")
+# Process V
+print("Processing V for boundaries...")
+zeros_we_v = np.zeros((len(all_ts), len(z), len(yv), len(x[:2])), dtype=np.float32)
+zeros_sn_v = np.zeros((len(all_ts), len(z), len(yv[:2]), len(x)), dtype=np.float32)
+ds_palm_we["V"] = xr.DataArray(zeros_we_v, dims=['time', 'z', 'yv', 'x'])
 ds_palm_we["V"] = multi_zinterp(max_pool, ds_we_vstag, "V", z, ds_palm_we)
-
-ds_palm_sn["V"] = xr.DataArray(np.copy(zeros_sn_v), dims=['time', 'z', 'yv', 'x'])
-print("Processing V for south/north")
+ds_palm_sn["V"] = xr.DataArray(zeros_sn_v, dims=['time', 'z', 'yv', 'x'])
 ds_palm_sn["V"] = multi_zinterp(max_pool, ds_sn_vstag, "V", z, ds_palm_sn)
+del zeros_we_v, zeros_sn_v
+gc.collect()
 
-#-------------------------------------------------------------------------------
-# Handle traffic variables in boundary conditions
-#-------------------------------------------------------------------------------
+# Traffic variables
 if has_traffic_vars:
     print("Setting up traffic variables in boundary conditions...")
     for base_species, traffic_species in traffic_mapping.items():
@@ -594,143 +762,95 @@ if has_traffic_vars:
 
 # Handle NaN values in boundary conditions
 print("Handling NaN values in boundary conditions...")
-for species in original_chem_species + aerosol_vars:
-    if species in ds_palm_we.data_vars:
-        if np.any(np.isnan(ds_palm_we[species].data)) or np.any(np.isnan(ds_palm_sn[species].data)):
-            print(f"Found NaN values for {species} in boundaries")
-            for ts in tqdm(range(len(all_ts)), desc=f"Fixing {species} NaNs", leave=False):
-                for y_idx in range(len(y)):
-                    west_profile = ds_palm_we[species].isel(time=ts, x=0, y=y_idx)
-                    if np.any(np.isnan(west_profile.data)):
-                        valid_mask = ~np.isnan(west_profile.data)
-                        if np.any(valid_mask):
-                            valid_z = z[valid_mask]
-                            valid_values = west_profile.data[valid_mask]
-                            nan_mask = np.isnan(west_profile.data)
-                            if np.any(nan_mask):
-                                nan_z = z[nan_mask]
-                                interp_values = np.interp(nan_z, valid_z, valid_values)
-                                west_data = west_profile.data.copy()
-                                west_data[nan_mask] = interp_values
-                                ds_palm_we[species].data[ts, :, y_idx, 0] = west_data
-                
-                for x_idx in range(len(x)):
-                    south_profile = ds_palm_sn[species].isel(time=ts, y=0, x=x_idx)
-                    if np.any(np.isnan(south_profile.data)):
-                        valid_mask = ~np.isnan(south_profile.data)
-                        if np.any(valid_mask):
-                            valid_z = z[valid_mask]
-                            valid_values = south_profile.data[valid_mask]
-                            nan_mask = np.isnan(south_profile.data)
-                            if np.any(nan_mask):
-                                nan_z = z[nan_mask]
-                                interp_values = np.interp(nan_z, valid_z, valid_values)
-                                south_data = south_profile.data.copy()
-                                south_data[nan_mask] = interp_values
-                                ds_palm_sn[species].data[ts, :, 0, x_idx] = south_data
-            
-            if np.any(np.isnan(ds_palm_we[species].data)):
-                ds_palm_we[species] = ds_palm_we[species].ffill('z').bfill('z')
-                ds_palm_we[species] = ds_palm_we[species].ffill('y').bfill('y')
-                ds_palm_we[species] = ds_palm_we[species].ffill('time').bfill('time')
-            
-            if np.any(np.isnan(ds_palm_sn[species].data)):
-                ds_palm_sn[species] = ds_palm_sn[species].ffill('z').bfill('z')
-                ds_palm_sn[species] = ds_palm_sn[species].ffill('x').bfill('x')
-                ds_palm_sn[species] = ds_palm_sn[species].ffill('time').bfill('time')
+for species in list(ds_palm_we.data_vars):
+    if np.any(np.isnan(ds_palm_we[species].data)) or np.any(np.isnan(ds_palm_sn[species].data)):
+        print(f"  Fixing NaNs for {species}...")
+        
+        # Check what dimensions the variable has
+        dims_we = ds_palm_we[species].dims
+        dims_sn = ds_palm_sn[species].dims
+        
+        # For W variable (has 'zw' instead of 'z')
+        if 'zw' in dims_we:
+            ds_palm_we[species] = ds_palm_we[species].ffill('zw').bfill('zw').fillna(0)
+        else:
+            ds_palm_we[species] = ds_palm_we[species].ffill('z').bfill('z').fillna(0)
+        
+        if 'zw' in dims_sn:
+            ds_palm_sn[species] = ds_palm_sn[species].ffill('zw').bfill('zw').fillna(0)
+        else:
+            ds_palm_sn[species] = ds_palm_sn[species].ffill('z').bfill('z').fillna(0)
+        
+        # Also handle other dimensions if needed
+        for dim in ['y', 'x', 'time']:
+            if dim in dims_we:
+                ds_palm_we[species] = ds_palm_we[species].ffill(dim).bfill(dim)
+            if dim in dims_sn:
+                ds_palm_sn[species] = ds_palm_sn[species].ffill(dim).bfill(dim)
+        
+        ds_palm_we[species] = ds_palm_we[species].fillna(0)
+        ds_palm_sn[species] = ds_palm_sn[species].fillna(0)
 
-#-------------------------------------------------------------------------------
-# Top boundary
-#-------------------------------------------------------------------------------
-print("Processing top boundary conditions...")
-u_top = np.zeros((len(all_ts), len(y), len(xu)))
-v_top = np.zeros((len(all_ts), len(yv), len(x)))
-w_top = np.zeros((len(all_ts), len(y), len(x)))
-qv_top = np.zeros((len(all_ts), len(y), len(x)))
-pt_top = np.zeros((len(all_ts), len(y), len(x)))
+#===============================================================================
+# Top Boundary (Vectorized)
+#===============================================================================
+print("\nProcessing top boundary conditions...")
+
+u_top = np.zeros((len(all_ts), len(y), len(xu)), dtype=np.float32)
+v_top = np.zeros((len(all_ts), len(yv), len(x)), dtype=np.float32)
+w_top = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+qv_top = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+pt_top = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
 
 chem_top = {}
 available_top_species = [s for s in all_chem_to_process if s in ds_interp.data_vars]
-print(f"Available species for top boundary: {available_top_species}")
 
 for species in available_top_species:
-    chem_top[species] = np.zeros((len(all_ts), len(y), len(x)))
+    chem_top[species] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
 
-for var in list(ds_interp.data_vars):
-    if var not in varbc_list and var not in all_chem_to_process:
-        ds_interp = ds_interp.drop(var)
-for var in list(ds_interp_u.data_vars):
-    if var not in ["U", "Z"] and var not in all_chem_to_process:
-        ds_interp_u = ds_interp_u.drop(var)
-for var in list(ds_interp_v.data_vars):
-    if var not in ["V", "Z"] and var not in all_chem_to_process:
-        ds_interp_v = ds_interp_v.drop(var)
-
-print("Processing top boundary datasets...")
-ds_interp_top = xr.Dataset()
-ds_interp_u_top = xr.Dataset()
-ds_interp_v_top = xr.Dataset()
-
-for var in ["QVAPOR", "pt"]:
-    ds_interp_top[var] = ds_interp.salem.wrf_zlevel(var, levels=z[-1]).copy()
-
-for species in available_top_species:
-    if species in ds_interp.data_vars:
-        ds_interp_top[species] = ds_interp.salem.wrf_zlevel(species, levels=z[-1]).copy()
-
-ds_interp_top["W"] = ds_interp.salem.wrf_zlevel("W", levels=zw[-1]).copy()
-ds_interp_u_top["U"] = ds_interp_u.salem.wrf_zlevel("U", levels=z[-1]).copy()
-ds_interp_v_top["V"] = ds_interp_v.salem.wrf_zlevel("V", levels=z[-1]).copy()
-
-print("Processing top boundary data for all timestamps...")
-for ts in tqdm(range(0, len(all_ts)), total=len(all_ts), position=0, leave=True):
-    u_top[ts, :, :] = ds_interp_u_top["U"].isel(time=ts)
-    v_top[ts, :, :] = ds_interp_v_top["V"].isel(time=ts)
-    w_top[ts, :, :] = ds_interp_top["W"].isel(time=ts)
-    pt_top[ts, :, :] = ds_interp_top["pt"].isel(time=ts)
-    qv_top[ts, :, :] = ds_interp_top["QVAPOR"].isel(time=ts)
+# Process top boundary - vectorized over time
+for ts in tqdm(range(len(all_ts)), desc="Top boundary"):
+    u_top[ts, :, :] = ds_interp_u["U"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    v_top[ts, :, :] = ds_interp_v["V"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    w_top[ts, :, :] = ds_interp["W"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    pt_top[ts, :, :] = ds_interp["pt"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    qv_top[ts, :, :] = ds_interp["QVAPOR"].isel(time=ts, bottom_top=-1).astype(np.float32)
     
     for species in available_top_species:
-        if species in ds_interp_top.data_vars:
-            chem_top[species][ts, :, :] = ds_interp_top[species].isel(time=ts)
+        if species in ds_interp.data_vars:
+            chem_top[species][ts, :, :] = ds_interp[species].isel(time=ts, bottom_top=-1).astype(np.float32)
 
-# Calculate aggregated species for top boundary
+# Aggregate species (vectorized)
 if "RH" in chem_species:
-    chem_top["RH"] = np.zeros((len(all_ts), len(y), len(x)))
-    for ts in range(len(all_ts)):
-        for comp in RH_components:
-            if comp in chem_top:
-                chem_top["RH"][ts, :, :] += chem_top[comp][ts, :, :]
+    chem_top["RH"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for comp in RH_components:
+        if comp in chem_top:
+            chem_top["RH"] += chem_top[comp]
 
 if "RO2" in chem_species:
-    chem_top["RO2"] = np.zeros((len(all_ts), len(y), len(x)))
-    for ts in range(len(all_ts)):
-        for comp in RO2_components:
-            if comp in chem_top:
-                chem_top["RO2"][ts, :, :] += chem_top[comp][ts, :, :]
+    chem_top["RO2"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for comp in RO2_components:
+        if comp in chem_top:
+            chem_top["RO2"] += chem_top[comp]
 
 if "RCHO" in chem_species:
-    chem_top["RCHO"] = np.zeros((len(all_ts), len(y), len(x)))
-    for ts in range(len(all_ts)):
-        for comp in RCHO_components:
-            if comp in chem_top:
-                chem_top["RCHO"][ts, :, :] += chem_top[comp][ts, :, :]
+    chem_top["RCHO"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for comp in RCHO_components:
+        if comp in chem_top:
+            chem_top["RCHO"] += chem_top[comp]
 
 if "OCSV" in chem_species:
-    chem_top["OCSV"] = np.zeros((len(all_ts), len(y), len(x)))
-    for ts in range(len(all_ts)):
-        for comp in OCSV_components:
-            if comp in chem_top:
-                chem_top["OCSV"][ts, :, :] += chem_top[comp][ts, :, :]
+    chem_top["OCSV"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for comp in OCSV_components:
+        if comp in chem_top:
+            chem_top["OCSV"] += chem_top[comp]
 
 if "OCNV" in chem_species:
-    chem_top["OCNV"] = np.zeros((len(all_ts), len(y), len(x)))
-    for ts in range(len(all_ts)):
-        for comp in OCNV_components:
-            if comp in chem_top:
-                chem_top["OCNV"][ts, :, :] += chem_top[comp][ts, :, :]
+    chem_top["OCNV"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for comp in OCNV_components:
+        if comp in chem_top:
+            chem_top["OCNV"] += chem_top[comp]
 
-# Handle traffic variables in top boundary
 if has_traffic_vars:
     for base_species, traffic_species in traffic_mapping.items():
         if base_species in chem_top:
@@ -746,67 +866,66 @@ for species in original_chem_species + aerosol_vars:
                 if np.any(nan_mask):
                     chem_top[species][ts, nan_mask] = mean_profile[ts]
 
-#-------------------------------------------------------------------------------
-# Geostrophic wind estimation
-#-------------------------------------------------------------------------------
-print("Geostrophic wind estimation...")
-ds_geostr = None
+#===============================================================================
+# Geostrophic Wind (Vectorized)
+#===============================================================================
+print("\nGeostrophic wind estimation...")
 
 if geostr_lvl == "z":
     lat_geostr = ds_drop.lat[:, 0]
-    dx_wrf = ds_drop.DX
-    dy_wrf = ds_drop.DY
     gph = ds_drop.gph.load()
-    ds_geostr_z = xr.Dataset()
-    ds_geostr_z = ds_geostr_z.assign_coords({"time": ds_drop.time.data,
-                                             "z": ds_drop["Z"].mean(("time", "south_north", "west_east")).data})
-    ds_geostr_z["ug"] = xr.DataArray(np.zeros((len(all_ts), len(gph.bottom_top.data))), dims=['time', 'z'])
-    ds_geostr_z["vg"] = xr.DataArray(np.zeros((len(all_ts), len(gph.bottom_top.data))), dims=['time', 'z'])
+    ds_geostr = xr.Dataset()
+    ds_geostr = ds_geostr.assign_coords({"time": ds_drop.time.data,
+                                         "z": ds_drop["Z"].mean(("time", "south_north", "west_east")).data})
+    ds_geostr["ug"] = xr.DataArray(np.zeros((len(all_ts), len(gph.bottom_top.data)), dtype=np.float32), dims=['time', 'z'])
+    ds_geostr["vg"] = xr.DataArray(np.zeros((len(all_ts), len(gph.bottom_top.data)), dtype=np.float32), dims=['time', 'z'])
 
-    for ts in tqdm(range(0, len(all_ts)), total=len(all_ts), position=0, leave=True):
+    for ts in tqdm(range(len(all_ts)), desc="Geostrophic wind"):
         for levels in gph.bottom_top.data:
-            ds_geostr_z["ug"][ts, levels], ds_geostr_z["vg"][ts, levels] = calc_geostrophic_wind_zlevels(
-                gph[ts, levels, :, :].data, lat_geostr.data, dy_wrf, dx_wrf)
+            ug, vg = calc_geostrophic_wind_zlevels(gph[ts, levels, :, :].data, lat_geostr.data, dy_wrf, dx_wrf)
+            ds_geostr["ug"][ts, levels] = ug
+            ds_geostr["vg"][ts, levels] = vg
 
-    ds_geostr = ds_geostr_z.interp({"z": z})
+    ds_geostr = ds_geostr.interp({"z": z})
 
 elif geostr_lvl == "p":
     pres = ds_drop.PRESSURE.load()
     tk = ds_drop.TK.load()
     lat_1d = ds_drop.lat[:, 0]
     lon_1d = ds_drop.lon[0, :]
+    
+    ds_geostr = xr.Dataset()
+    ds_geostr = ds_geostr.assign_coords({"time": ds_drop.time.data,
+                                         "z": ds_drop["Z"].mean(("time", "south_north", "west_east")).data})
+    ds_geostr["ug"] = xr.DataArray(np.zeros((len(all_ts), len(pres.bottom_top.data)), dtype=np.float32), dims=['time', 'z'])
+    ds_geostr["vg"] = xr.DataArray(np.zeros((len(all_ts), len(pres.bottom_top.data)), dtype=np.float32), dims=['time', 'z'])
 
-    ds_geostr_p = xr.Dataset()
-    ds_geostr_p = ds_geostr_p.assign_coords({"time": ds_drop.time.data,
-                                             "z": ds_drop["Z"].mean(("time", "south_north", "west_east")).data})
-    ds_geostr_p["ug"] = xr.DataArray(np.zeros((len(all_ts), len(pres.bottom_top.data))), dims=['time', 'z'])
-    ds_geostr_p["vg"] = xr.DataArray(np.zeros((len(all_ts), len(pres.bottom_top.data))), dims=['time', 'z'])
-
-    for ts in tqdm(range(0, len(all_ts)), total=len(all_ts), position=0, leave=True):
+    for ts in tqdm(range(len(all_ts)), desc="Geostrophic wind"):
         for levels in pres.bottom_top.data:
-            ds_geostr_p["ug"][ts, levels], ds_geostr_p["vg"][ts, levels] = calc_geostrophic_wind_plevels(
-                pres[ts, levels, :, :].data, tk[ts, levels, :, :].data, lat_1d, lon_1d, dy_wrf, dx_wrf)
+            geo_wind = calc_geostrophic_wind_plevels(pres[ts, levels, :, :].data, tk[ts, levels, :, :].data,
+                                                      lat_1d, lon_1d, dy_wrf, dx_wrf)
+            ds_geostr["ug"][ts, levels] = geo_wind[0]
+            ds_geostr["vg"][ts, levels] = geo_wind[1]
 
-    ds_geostr = ds_geostr_p.interp({"z": z})
+    ds_geostr = ds_geostr.interp({"z": z})
 else:
-    print(f"Warning: geostr_lvl '{geostr_lvl}' not recognized.")
     ds_geostr = xr.Dataset()
     ds_geostr = ds_geostr.assign_coords({"time": all_ts, "z": z})
-    ds_geostr["ug"] = xr.DataArray(np.zeros((len(all_ts), len(z))), dims=['time', 'z'])
-    ds_geostr["vg"] = xr.DataArray(np.zeros((len(all_ts), len(z))), dims=['time', 'z'])
+    ds_geostr["ug"] = xr.DataArray(np.zeros((len(all_ts), len(z)), dtype=np.float32), dims=['time', 'z'])
+    ds_geostr["vg"] = xr.DataArray(np.zeros((len(all_ts), len(z)), dtype=np.float32), dims=['time', 'z'])
 
-#-------------------------------------------------------------------------------
-# Surface NaNs
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Surface NaNs (Vectorized)
+#===============================================================================
 print("Resolving surface NaNs...")
 with Pool(max_pool) as p:
     pool_outputs = list(
         tqdm(
-            p.imap(partial(solve_surface, all_ts, ds_palm_we, ds_palm_sn, surface_var_dict), surface_var_dict.keys()),
+            p.imap(partial(solve_surface, all_ts, ds_palm_we, ds_palm_sn, surface_var_dict), 
+                   surface_var_dict.keys()),
             total=len(surface_var_dict.keys()), position=0, leave=True
         )
     )
-p.join()
 pool_dict = dict(pool_outputs)
 for var in surface_var_dict.keys():
     ds_palm_we[var] = pool_dict[var][0]
@@ -817,377 +936,543 @@ if ds_geostr is not None:
         ds_geostr["ug"][t, :] = surface_nan_w(ds_geostr["ug"][t, :].data)
         ds_geostr["vg"][t, :] = surface_nan_w(ds_geostr["vg"][t, :].data)
 
-#-------------------------------------------------------------------------------
-# Calculate initial profiles
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Horizontal Interpolation (Vectorized via xarray)
+#===============================================================================
+
+#  LU_INDEX separately with NEAREST neighbor
+if 'LU_INDEX' in ds_drop.data_vars:
+    print("  Interpolating LU_INDEX with NEAREST neighbor (preserves categories)...")
+    
+    # Use nearest neighbor for categorical land use data
+    ds_interp['LU_INDEX'] = ds_drop['LU_INDEX'].interp(
+        {"west_east": ds_drop.west_east_palm}, 
+        method='nearest'
+    ).interp(
+        {"south_north": ds_drop.south_north_palm}, 
+        method='nearest'
+    ).astype(np.int32)
+    
+    print(f"    LU_INDEX interpolated shape: {ds_interp['LU_INDEX'].shape}")
+    print(f"    Unique values after interpolation: {np.unique(ds_interp['LU_INDEX'].isel(time=0).values)}")
+#===============================================================================
+# Initial Profiles (Vectorized)
+#===============================================================================
+print("Calculating initial profiles...")
 ds_drop["bottom_top"] = ds_drop["Z"].mean(("time", "south_north", "west_east")).data
 
 u_init = ds_drop["U"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
-    {"bottom_top": z}, method=interp_mode)
+    {"bottom_top": z}, method=interp_mode).astype(np.float32)
 v_init = ds_drop["V"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
-    {"bottom_top": z}, method=interp_mode)
+    {"bottom_top": z}, method=interp_mode).astype(np.float32)
 w_init = ds_drop["W"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
-    {"bottom_top": zw}, method=interp_mode)
+    {"bottom_top": zw}, method=interp_mode).astype(np.float32)
 qv_init = ds_drop["QVAPOR"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
-    {"bottom_top": z}, method=interp_mode)
+    {"bottom_top": z}, method=interp_mode).astype(np.float32)
 pt_init = ds_drop["pt"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
-    {"bottom_top": z}, method=interp_mode)
+    {"bottom_top": z}, method=interp_mode).astype(np.float32)
 
-u_init = surface_nan_uv(u_init.load().data, z, u10_wrf.sel(time=dt_start).mean(
-    dim=["south_north", "west_east"]).data)
-v_init = surface_nan_uv(v_init.load().data, z, v10_wrf.sel(time=dt_start).mean(
-    dim=["south_north", "west_east"]).data)
-w_init = surface_nan_w(w_init.load().data)
-qv_init = surface_nan_s(qv_init.load().data, z, qv2_wrf.sel(time=dt_start).mean(
-    dim=["south_north", "west_east"]).data)
-pt_init = surface_nan_s(pt_init.load().data, z, pt2_wrf.sel(time=dt_start).mean(
-    dim=["south_north", "west_east"]).data)
+# Fix surface values
+u10_mean = u10_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
+v10_mean = v10_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
+qv2_mean = qv2_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
+pt2_mean = pt2_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
 
-#===============================================================================
-# CRITICAL: Initialize chem_init HERE (before any traffic variable handling)
-#===============================================================================
+u_init = surface_nan_uv(u_init.data, z, u10_mean)
+v_init = surface_nan_uv(v_init.data, z, v10_mean)
+w_init = surface_nan_w(w_init.data)
+qv_init = surface_nan_s(qv_init.data, z, qv2_mean)
+pt_init = surface_nan_s(pt_init.data, z, pt2_mean)
+
+# Initialize chemistry profiles (vectorized)
 chem_init = {}
 for species in all_chem_to_process:
     if species in ds_drop.data_vars:
         chem_data = ds_drop[species].sel(time=dt_start).mean(
             dim=["south_north", "west_east"]).interp(
-            {"bottom_top": z}, method=interp_mode).load().data
+            {"bottom_top": z}, method=interp_mode).load().data.astype(np.float32)
         chem_init[species] = xr.DataArray(chem_data, dims=['z'], coords={'z': z})
     else:
-        chem_init[species] = xr.DataArray(np.zeros(len(z)), dims=['z'], coords={'z': z})
+        chem_init[species] = xr.DataArray(np.zeros(len(z), dtype=np.float32), dims=['z'], coords={'z': z})
 
-# Calculate aggregated species initial profiles
+# Aggregate species (vectorized)
 if "RH" in chem_species:
-    rh_init = np.zeros(len(z))
+    rh_init = np.zeros(len(z), dtype=np.float32)
     for comp in RH_components:
         if comp in chem_init:
             rh_init += chem_init[comp].values
     chem_init["RH"] = xr.DataArray(rh_init, dims=['z'], coords={'z': z})
 
 if "RO2" in chem_species:
-    ro2_init = np.zeros(len(z))
+    ro2_init = np.zeros(len(z), dtype=np.float32)
     for comp in RO2_components:
         if comp in chem_init:
             ro2_init += chem_init[comp].values
     chem_init["RO2"] = xr.DataArray(ro2_init, dims=['z'], coords={'z': z})
 
 if "RCHO" in chem_species:
-    rcho_init = np.zeros(len(z))
+    rcho_init = np.zeros(len(z), dtype=np.float32)
     for comp in RCHO_components:
         if comp in chem_init:
             rcho_init += chem_init[comp].values
     chem_init["RCHO"] = xr.DataArray(rcho_init, dims=['z'], coords={'z': z})
 
 if "OCSV" in chem_species:
-    ocsv_init = np.zeros(len(z))
+    ocsv_init = np.zeros(len(z), dtype=np.float32)
     for comp in OCSV_components:
         if comp in chem_init:
             ocsv_init += chem_init[comp].values
     chem_init["OCSV"] = xr.DataArray(ocsv_init, dims=['z'], coords={'z': z})
 
 if "OCNV" in chem_species:
-    ocnv_init = np.zeros(len(z))
+    ocnv_init = np.zeros(len(z), dtype=np.float32)
     for comp in OCNV_components:
         if comp in chem_init:
             ocnv_init += chem_init[comp].values
     chem_init["OCNV"] = xr.DataArray(ocnv_init, dims=['z'], coords={'z': z})
 
-#-------------------------------------------------------------------------------
-# Handle traffic variables in initial profiles (NOW chem_init exists!)
-#-------------------------------------------------------------------------------
 if has_traffic_vars:
-    print("Setting up traffic variables in initial profiles...")
     for base_species, traffic_species in traffic_mapping.items():
         if base_species in chem_init:
             chem_init[traffic_species] = chem_init[base_species].copy()
-            print(f"  Created {traffic_species} initial profile from {base_species}")
 
-#-------------------------------------------------------------------------------
-# Calculate surface pressure (NOW after chem_init)
-#-------------------------------------------------------------------------------
-surface_pres = psfc_wrf[:, :, :].mean(dim=["south_north", "west_east"]).load()
+surface_pres = psfc_wrf[:, :, :].mean(dim=["south_north", "west_east"]).load().astype(np.float32)
 
-#-------------------------------------------------------------------------------
-# AEROSOL PROCESSING - Using proper bin overlap mapping
-#-------------------------------------------------------------------------------
+#===============================================================================
+# AEROSOL PROCESSING - COMPLETE MODIFIED VERSION
+# Properly separates soluble and insoluble species for mass_fracs_a and mass_fracs_b
+# INCLUDES TRACE METALS FROM STREET TYPE CLASSIFICATION
+# WITH 2A/2B BIN SEPARATION
+#===============================================================================
+
 if aerosol_wrfchem:
     print("\n" + "="*60)
-    print("PROCESSING AEROSOL DATA (Size-distribution preserving method)")
+    print("PROCESSING AEROSOL DATA (Vectorized - with 2a/2b separation)")
     print("="*60)
     
-    # Get bin definitions for output
+    # ===== BIN DEFINITIONS =====
     dmid, bin_limits = define_bins(nbin, reglim)
-    nbins = len(dmid)
+    n_bins_1 = nbin[0]   # Bins in subrange 1 (nucleation mode)
+    n_bins_2 = nbin[1]   # Bins in subrange 2 (accumulation/coarse)
+    
+    # Total bins depends on nf2a
+    if nf2a < 1.0:
+        dmid_1 = dmid[:n_bins_1]
+        dmid_2 = dmid[n_bins_1:]
+        dmid_all = np.concatenate([dmid_1, dmid_2, dmid_2])
+        nbins_total = len(dmid_all)
+        print(f"PALM bins: {nbins_total} ({n_bins_1} subrange 1 + {n_bins_2} subrange 2a + {n_bins_2} subrange 2b)")
+    else:
+        dmid_all = dmid
+        nbins_total = len(dmid)
+        print(f"PALM bins: {nbins_total} ({n_bins_1} subrange 1 + {n_bins_2} subrange 2a)")
+    
     n_species = len(listspec)
+    n_wrf_bins = len(WRFCHEM_BIN_SUFFIXES)
     
-    # CRITICAL: Calculate bin overlap ratios ONCE
-    print("Calculating bin overlap ratios...")
+    print(f"Species: {n_species}, WRF-Chem bins: {n_wrf_bins}")
+    print(f"nf2a = {nf2a} (soluble fraction factor)")
+    
+    # ===== SPECIES PARTITIONING FACTORS (2a vs 2b) =====
+    PARTITION_2A = {
+        'SO4': 0.90, 'OC': 0.70, 'BC': 0.10, 'DU': 0.10,
+        'SS': 0.90, 'NH': 0.90, 'NO': 0.90,
+        'PB': 0.50, 'HG': 0.50, 'NI': 0.50, 'CD': 0.50, 'AS': 0.50
+    }
+    DEFAULT_PARTITION_2A = 0.50
+    
+    def get_partition_2a(species):
+        return PARTITION_2A.get(species, DEFAULT_PARTITION_2A)
+    
+    print(f"\nSpecies partitioning (2a fraction):")
+    for spec in listspec:
+        if spec in PARTITION_2A or is_trace_metal(spec):
+            frac = get_partition_2a(spec)
+            print(f"  {spec:<6}: {frac*100:.0f}% to 2a, {(1-frac)*100:.0f}% to 2b")
+    
+    # ===== CALCULATE BIN OVERLAP RATIOS =====
+    print("\nCalculating bin overlap ratios...")
     open_bins, overlap_ratio = aerosol_binoverlap(bin_limits, wrfchem_bin_limits)
+    overlap_ratio = overlap_ratio.astype(np.float32)
     print(f"  Overlap matrix shape: {overlap_ratio.shape}")
-    print(f"  Open bins: {open_bins}")
     
-    # Step 1: For initial profile, calculate mass fractions and number concentration
-    print("\nCalculating aerosol mass fractions for initial profile...")
+    # Get bin centers for reference
+    palm_bin_centers = vectorized_bin_limits_to_centers(bin_limits)
+    wrf_bin_centers = vectorized_bin_limits_to_centers(np.array(wrfchem_bin_limits))
+    print(f"  PALM bin centers (nm): {[f'{c*1e9:.1f}' for c in palm_bin_centers]}")
+    print(f"  WRF bin centers (nm):  {[f'{c*1e9:.1f}' for c in wrf_bin_centers]}")
     
-    # Initialize arrays
-    mass_fracs_a_init = np.zeros((len(z), n_species), dtype=np.float32)
-    mass_fracs_b_init = np.zeros((len(z), n_species), dtype=np.float32)
-    aerosol_concentration_init = np.zeros((len(z), nbins), dtype=np.float32)
+    # ===== SPECIES CLASSIFICATION =====
+    print(f"\nSpecies classification:")
+    print(f"  Insoluble species: {INSOLUBLE_SPECIES}")
+    print(f"  Soluble species:   {SOLUBLE_SPECIES}")
     
-    # Get WRF vertical levels for interpolation
-    wrf_z = ds_drop["Z"].mean(("time", "south_north", "west_east")).data
+    # Verify all species are classified
+    for spec in listspec:
+        if spec not in INSOLUBLE_SPECIES and spec not in SOLUBLE_SPECIES:
+            print(f"WARNING: Species '{spec}' not classified! Adding to soluble by default.")
+            SOLUBLE_SPECIES.append(spec)
     
-    # For each vertical level
-    for zlev in tqdm(range(len(z)), desc="  Calculating mass fractions"):
-        # Find closest WRF level
-        closest_wrf_lev = np.argmin(np.abs(wrf_z - z[zlev]))
+    insoluble_indices = [i for i, spec in enumerate(listspec) if spec in INSOLUBLE_SPECIES]
+    soluble_indices = [i for i, spec in enumerate(listspec) if spec in SOLUBLE_SPECIES]
+    
+    # ===== HELPER FUNCTION: Create separated mass fractions =====
+    def create_separated_mass_fractions(mass_array_orig, array_name="unknown"):
+        orig_shape = mass_array_orig.shape
+        n_dims = len(orig_shape)
         
-        # Sum up mass for each species across all bins
-        total_mass = 0
-        spec_mass = np.zeros(n_species)
+        mass_a = np.zeros_like(mass_array_orig)
+        mass_b = np.zeros_like(mass_array_orig)
         
+        if nf2a == 1.0:
+            mass_a = mass_array_orig.copy()
+            mass_b = np.zeros_like(mass_array_orig)
+        else:
+            # Apply species-specific partitioning
+            for idx, spec in enumerate(listspec):
+                frac_2a = get_partition_2a(spec)
+                idx_slice = [slice(None)] * n_dims
+                idx_slice[-1] = idx
+                mass_a[tuple(idx_slice)] = mass_array_orig[tuple(idx_slice)] * frac_2a
+                mass_b[tuple(idx_slice)] = mass_array_orig[tuple(idx_slice)] * (1.0 - frac_2a)
+        
+        def normalize_along_species_axis(arr):
+            total = np.sum(arr, axis=-1, keepdims=True)
+            total = np.where(total < 1e-30, 1.0, total)
+            return arr / total
+        
+        mass_fracs_a = normalize_along_species_axis(mass_a)
+        mass_fracs_b = normalize_along_species_axis(mass_b)
+        
+        if array_name == "init_profile":
+            sum_a = np.mean(np.sum(mass_fracs_a, axis=-1))
+            sum_b = np.mean(np.sum(mass_fracs_b, axis=-1))
+            print(f"    {array_name} normalization check - a: {sum_a:.6f}, b: {sum_b:.6f}")
+        
+        return mass_fracs_a, mass_fracs_b
+    
+    # ===== STEP 1: Initial Profile Aerosol Processing =====
+    print("\n" + "-"*40)
+    print("STEP 1: Calculating aerosol initial profiles...")
+    print("-"*40)
+    
+    # Collect mass concentrations for all species
+    mass_matrix = np.zeros((len(z), n_species), dtype=np.float32)
+    
+    # Process explicit WRF-Chem species
+    for idx, spec in enumerate(listspec):
+        if is_trace_metal(spec):
+            continue
+        wrfchem_names = get_wrfchem_variables_for_species(spec)
+        for wrfchem_name in wrfchem_names:
+            for bin_suffix in WRFCHEM_BIN_SUFFIXES:
+                var_name = f'{wrfchem_name}{bin_suffix}'
+                if var_name in chem_init:
+                    mass_matrix[:, idx] += chem_init[var_name].values
+    
+    # Add trace metals using dynamic PM2.5 scaling
+    trace_metal_added = False
+    for idx, spec in enumerate(listspec):
+        if is_trace_metal(spec):
+            if street_type_surface is not None and 'PM2_5_DRY' in chem_init:
+                pm25_1d = chem_init['PM2_5_DRY'].values
+                mean_fraction = np.mean(get_trace_metal_mass_fraction(spec, street_type_surface))
+                mass_matrix[:, idx] = pm25_1d * mean_fraction
+                trace_metal_added = True
+                print(f"  {spec}: Dynamic scaling - PM2.5 range [{np.min(pm25_1d):.2f}-{np.max(pm25_1d):.2f}] μg/m³")
+            else:
+                mass_matrix[:, idx] = 0.0
+    
+    if trace_metal_added:
+        print("  Trace metals added to initial profile")
+    
+    # Calculate initial mass fractions
+    mass_fracs_orig = vectorized_mass_fraction_batch(mass_matrix)
+    
+    # Separate into a and b fractions
+    mass_fracs_a_init, mass_fracs_b_init = create_separated_mass_fractions(
+        mass_fracs_orig, "init_profile"
+    )
+    
+    # Collect number concentrations for all WRF bins
+    wrf_num_matrix = np.zeros((len(z), n_wrf_bins), dtype=np.float32)
+    for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+        num_var = f'num{bin_suffix}'
+        if num_var in chem_init:
+            wrf_num_matrix[:, wbin] = chem_init[num_var].values
+    
+    # Map to PALM bins (produces 10 bins: n_bins_1 + n_bins_2)
+    aerosol_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_matrix, overlap_ratio)
+    
+    # Split into 1a, 2a, and 2b bins if nf2a < 1.0
+    if nf2a < 1.0:
+        conc_1 = aerosol_conc_10bin[:, :n_bins_1]
+        conc_2 = aerosol_conc_10bin[:, n_bins_1:]
+        conc_2a = conc_2 * nf2a
+        conc_2b = conc_2 * (1.0 - nf2a)
+        aerosol_concentration_init = np.concatenate([conc_1, conc_2a, conc_2b], axis=1)
+    else:
+        aerosol_concentration_init = aerosol_conc_10bin
+    
+    # Store in chem_init
+    chem_init['mass_fracs_a'] = xr.DataArray(mass_fracs_a_init.astype(np.float32), 
+                                              dims=['z', 'composition_index'])
+    chem_init['mass_fracs_b'] = xr.DataArray(mass_fracs_b_init.astype(np.float32), 
+                                              dims=['z', 'composition_index'])
+    chem_init['aerosol'] = xr.DataArray(aerosol_concentration_init.astype(np.float32), 
+                                         dims=['z', 'Dmid'])
+    
+    print(f"\n  Aerosol concentration shape: {aerosol_concentration_init.shape}")
+    print(f"    (Should be (nz, {nbins_total}) with nf2a={nf2a})")
+    
+    # Print composition summary
+    print(f"\n  Composition summary (averaged over all z levels):")
+    print(f"    {'Species':<8} {'mass_fracs_a':<15} {'mass_fracs_b':<15}")
+    print(f"    {'-'*8} {'-'*15} {'-'*15}")
+    for i, spec in enumerate(listspec):
+        mean_a = np.mean(mass_fracs_a_init[:, i])
+        mean_b = np.mean(mass_fracs_b_init[:, i])
+        print(f"    {spec:<8} {mean_a:>14.6f} {mean_b:>14.6f}")
+    
+    # ===== STEP 2: Boundary Conditions Aerosol Processing =====
+    print("\n" + "-"*40)
+    print("STEP 2: Calculating aerosol boundary conditions...")
+    print("-"*40)
+    
+    # Initialize arrays for boundaries (using nbins_total)
+    left_aerosol = np.zeros((len(all_ts), len(z), len(y), nbins_total), dtype=np.float32)
+    right_aerosol = np.zeros((len(all_ts), len(z), len(y), nbins_total), dtype=np.float32)
+    south_aerosol = np.zeros((len(all_ts), len(z), len(x), nbins_total), dtype=np.float32)
+    north_aerosol = np.zeros((len(all_ts), len(z), len(x), nbins_total), dtype=np.float32)
+    top_aerosol = np.zeros((len(all_ts), len(y), len(x), nbins_total), dtype=np.float32)
+    
+    # Mass fraction boundaries
+    left_mass_orig = np.zeros((len(all_ts), len(z), len(y), n_species), dtype=np.float32)
+    right_mass_orig = np.zeros((len(all_ts), len(z), len(y), n_species), dtype=np.float32)
+    south_mass_orig = np.zeros((len(all_ts), len(z), len(x), n_species), dtype=np.float32)
+    north_mass_orig = np.zeros((len(all_ts), len(z), len(x), n_species), dtype=np.float32)
+    top_mass_orig = np.zeros((len(all_ts), len(y), len(x), n_species), dtype=np.float32)
+    
+    # ----- West/East Boundaries -----
+    print("  Processing West/East boundaries...")
+    for ts in tqdm(range(len(all_ts)), desc="  West/East", leave=False):
+        for zlev in range(len(z)):
+            # Collect number concentrations
+            wrf_num_left = np.zeros((len(y), n_wrf_bins), dtype=np.float32)
+            wrf_num_right = np.zeros((len(y), n_wrf_bins), dtype=np.float32)
+            
+            for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+                num_var = f'num{bin_suffix}'
+                if num_var in ds_palm_we.data_vars:
+                    wrf_num_left[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=0).data
+                    wrf_num_right[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=-1).data
+            
+            # Map to PALM bins (10 bins)
+            left_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_left, overlap_ratio)
+            right_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_right, overlap_ratio)
+            
+            # Split into 1a, 2a, 2b
+            if nf2a < 1.0:
+                left_conc_1 = left_conc_10bin[:, :n_bins_1]
+                left_conc_2 = left_conc_10bin[:, n_bins_1:]
+                left_conc_2a = left_conc_2 * nf2a
+                left_conc_2b = left_conc_2 * (1.0 - nf2a)
+                left_aerosol[ts, zlev, :, :] = np.concatenate([left_conc_1, left_conc_2a, left_conc_2b], axis=1)
+                
+                right_conc_1 = right_conc_10bin[:, :n_bins_1]
+                right_conc_2 = right_conc_10bin[:, n_bins_1:]
+                right_conc_2a = right_conc_2 * nf2a
+                right_conc_2b = right_conc_2 * (1.0 - nf2a)
+                right_aerosol[ts, zlev, :, :] = np.concatenate([right_conc_1, right_conc_2a, right_conc_2b], axis=1)
+            else:
+                left_aerosol[ts, zlev, :, :] = left_conc_10bin
+                right_aerosol[ts, zlev, :, :] = right_conc_10bin
+            
+            # Collect mass for explicit WRF-Chem species
+            for idx, spec in enumerate(listspec):
+                if is_trace_metal(spec):
+                    continue
+                wrfchem_names = get_wrfchem_variables_for_species(spec)
+                for wrfchem_name in wrfchem_names:
+                    for bin_suffix in WRFCHEM_BIN_SUFFIXES:
+                        var_name = f'{wrfchem_name}{bin_suffix}'
+                        if var_name in ds_palm_we.data_vars:
+                            left_mass_orig[ts, zlev, :, idx] += ds_palm_we[var_name].isel(time=ts, z=zlev, x=0).data
+                            right_mass_orig[ts, zlev, :, idx] += ds_palm_we[var_name].isel(time=ts, z=zlev, x=-1).data
+            
+            # Add trace metals for boundaries - DYNAMIC PM2.5 SCALING
+            if 'PM2_5_DRY' in ds_palm_we.data_vars:
+                pm25_left = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=0).data
+                pm25_right = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=-1).data
+                
+                for idx, spec in enumerate(listspec):
+                    if is_trace_metal(spec):
+                        fraction_left = get_trace_metal_mass_fraction(spec, street_type_we[:, 0])
+                        fraction_right = get_trace_metal_mass_fraction(spec, street_type_we[:, 1])
+                        left_mass_orig[ts, zlev, :, idx] = pm25_left * fraction_left
+                        right_mass_orig[ts, zlev, :, idx] = pm25_right * fraction_right
+    
+    # ----- South/North Boundaries -----
+    print("  Processing South/North boundaries...")
+    for ts in tqdm(range(len(all_ts)), desc="  South/North", leave=False):
+        for zlev in range(len(z)):
+            wrf_num_south = np.zeros((len(x), n_wrf_bins), dtype=np.float32)
+            wrf_num_north = np.zeros((len(x), n_wrf_bins), dtype=np.float32)
+            
+            for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+                num_var = f'num{bin_suffix}'
+                if num_var in ds_palm_sn.data_vars:
+                    wrf_num_south[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=0).data
+                    wrf_num_north[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=-1).data
+            
+            # Map to PALM bins (10 bins)
+            south_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_south, overlap_ratio)
+            north_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_north, overlap_ratio)
+            
+            # Split into 1a, 2a, 2b
+            if nf2a < 1.0:
+                south_conc_1 = south_conc_10bin[:, :n_bins_1]
+                south_conc_2 = south_conc_10bin[:, n_bins_1:]
+                south_conc_2a = south_conc_2 * nf2a
+                south_conc_2b = south_conc_2 * (1.0 - nf2a)
+                south_aerosol[ts, zlev, :, :] = np.concatenate([south_conc_1, south_conc_2a, south_conc_2b], axis=1)
+                
+                north_conc_1 = north_conc_10bin[:, :n_bins_1]
+                north_conc_2 = north_conc_10bin[:, n_bins_1:]
+                north_conc_2a = north_conc_2 * nf2a
+                north_conc_2b = north_conc_2 * (1.0 - nf2a)
+                north_aerosol[ts, zlev, :, :] = np.concatenate([north_conc_1, north_conc_2a, north_conc_2b], axis=1)
+            else:
+                south_aerosol[ts, zlev, :, :] = south_conc_10bin
+                north_aerosol[ts, zlev, :, :] = north_conc_10bin
+            
+            # Collect mass for explicit WRF-Chem species
+            for idx, spec in enumerate(listspec):
+                if is_trace_metal(spec):
+                    continue
+                wrfchem_names = get_wrfchem_variables_for_species(spec)
+                for wrfchem_name in wrfchem_names:
+                    for bin_suffix in WRFCHEM_BIN_SUFFIXES:
+                        var_name = f'{wrfchem_name}{bin_suffix}'
+                        if var_name in ds_palm_sn.data_vars:
+                            south_mass_orig[ts, zlev, :, idx] += ds_palm_sn[var_name].isel(time=ts, z=zlev, y=0).data
+                            north_mass_orig[ts, zlev, :, idx] += ds_palm_sn[var_name].isel(time=ts, z=zlev, y=-1).data
+            
+            # Add trace metals for boundaries - DYNAMIC PM2.5 SCALING
+            if 'PM2_5_DRY' in ds_palm_sn.data_vars:
+                pm25_south = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=0).data
+                pm25_north = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=-1).data
+                
+                for idx, spec in enumerate(listspec):
+                    if is_trace_metal(spec):
+                        fraction_south = get_trace_metal_mass_fraction(spec, street_type_sn[0, :])
+                        fraction_north = get_trace_metal_mass_fraction(spec, street_type_sn[1, :])
+                        south_mass_orig[ts, zlev, :, idx] = pm25_south * fraction_south
+                        north_mass_orig[ts, zlev, :, idx] = pm25_north * fraction_north
+    
+    # ----- Top Boundary -----
+    print("  Processing Top boundary...")
+    for ts in tqdm(range(len(all_ts)), desc="  Top", leave=False):
+        wrf_num_top = np.zeros((len(y), len(x), n_wrf_bins), dtype=np.float32)
+        
+        for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+            num_var = f'num{bin_suffix}'
+            if num_var in chem_top:
+                wrf_num_top[:, :, wbin] = chem_top[num_var][ts, :, :]
+        
+        wrf_num_top_flat = wrf_num_top.reshape(-1, n_wrf_bins)
+        top_conc_10bin_flat = vectorized_batch_aerosol_mapping(wrf_num_top_flat, overlap_ratio)
+        top_conc_10bin = top_conc_10bin_flat.reshape(len(y), len(x), -1)
+        
+        # Split into 1a, 2a, 2b
+        if nf2a < 1.0:
+            top_conc_1 = top_conc_10bin[:, :, :n_bins_1]
+            top_conc_2 = top_conc_10bin[:, :, n_bins_1:]
+            top_conc_2a = top_conc_2 * nf2a
+            top_conc_2b = top_conc_2 * (1.0 - nf2a)
+            top_aerosol[ts, :, :, :] = np.concatenate([top_conc_1, top_conc_2a, top_conc_2b], axis=2)
+        else:
+            top_aerosol[ts, :, :, :] = top_conc_10bin
+        
+        # Collect mass for explicit WRF-Chem species
         for idx, spec in enumerate(listspec):
-            mass_val = 0
+            if is_trace_metal(spec):
+                continue
             wrfchem_names = get_wrfchem_variables_for_species(spec)
             for wrfchem_name in wrfchem_names:
                 for bin_suffix in WRFCHEM_BIN_SUFFIXES:
                     var_name = f'{wrfchem_name}{bin_suffix}'
-                    if var_name in chem_init:
-                        mass_val += chem_init[var_name].values[zlev]
-            spec_mass[idx] = mass_val
-            total_mass += mass_val
+                    if var_name in chem_top:
+                        top_mass_orig[ts, :, :, idx] += chem_top[var_name][ts, :, :]
         
-        # Calculate mass fractions
-        if total_mass > 0:
-            mass_fracs_a_init[zlev, :] = spec_mass / total_mass
-        else:
-            mass_fracs_a_init[zlev, :] = 1.0 / n_species
-        
-        # Calculate aerosol number concentration using overlap ratios
-        wrf_num = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-        for wrf_bin_idx, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
-            num_var = f'num{bin_suffix}'
-            if num_var in chem_init:
-                wrf_num[wrf_bin_idx] = chem_init[num_var].values[zlev]
-        
-        # Matrix multiplication for bin distribution (vectorized)
-        for pbin in range(nbins):
-            total = 0
-            for wbin in range(len(WRFCHEM_BIN_SUFFIXES)):
-                total += wrf_num[wbin] * overlap_ratio[pbin, wbin]
-            aerosol_concentration_init[zlev, pbin] = total
+        # Add trace metals for top boundary - DYNAMIC PM2.5 SCALING
+        if 'PM2_5_DRY' in chem_top:
+            pm25_top = chem_top['PM2_5_DRY'][ts, :, :]
+            for idx, spec in enumerate(listspec):
+                if is_trace_metal(spec):
+                    fraction_top = get_trace_metal_mass_fraction(spec, street_type_surface)
+                    top_mass_orig[ts, :, :, idx] = pm25_top * fraction_top
     
-    # Store in chem_init
-    chem_init['mass_fracs_a'] = xr.DataArray(mass_fracs_a_init, dims=['z', 'composition_index'])
-    chem_init['mass_fracs_b'] = xr.DataArray(mass_fracs_b_init, dims=['z', 'composition_index'])
-    chem_init['aerosol'] = xr.DataArray(aerosol_concentration_init, dims=['z', 'Dmid'])
+    # ===== STEP 3: Normalize and Separate Boundary Mass Fractions =====
+    print("\n" + "-"*40)
+    print("STEP 3: Normalizing and separating boundary mass fractions...")
+    print("-"*40)
     
-    # Step 2: Calculate boundary conditions using overlap ratios
-    print("\nCalculating aerosol boundary conditions...")
+    def normalize_boundary_mass(mass_array):
+        total = np.sum(mass_array, axis=-1, keepdims=True)
+        total = np.where(total < 1e-30, 1.0, total)
+        return mass_array / total
     
-    # Initialize arrays for boundaries
-    left_aerosol = np.zeros((len(all_ts), len(z), len(y), nbins), dtype=np.float32)
-    right_aerosol = np.zeros((len(all_ts), len(z), len(y), nbins), dtype=np.float32)
-    south_aerosol = np.zeros((len(all_ts), len(z), len(x), nbins), dtype=np.float32)
-    north_aerosol = np.zeros((len(all_ts), len(z), len(x), nbins), dtype=np.float32)
-    top_aerosol = np.zeros((len(all_ts), len(y), len(x), nbins), dtype=np.float32)
+    left_mass_orig_norm = normalize_boundary_mass(left_mass_orig)
+    right_mass_orig_norm = normalize_boundary_mass(right_mass_orig)
+    south_mass_orig_norm = normalize_boundary_mass(south_mass_orig)
+    north_mass_orig_norm = normalize_boundary_mass(north_mass_orig)
+    top_mass_orig_norm = normalize_boundary_mass(top_mass_orig)
     
-    left_mass_a = np.zeros((len(all_ts), len(z), len(y), n_species), dtype=np.float32)
-    right_mass_a = np.zeros((len(all_ts), len(z), len(y), n_species), dtype=np.float32)
-    south_mass_a = np.zeros((len(all_ts), len(z), len(x), n_species), dtype=np.float32)
-    north_mass_a = np.zeros((len(all_ts), len(z), len(x), n_species), dtype=np.float32)
-    top_mass_a = np.zeros((len(all_ts), len(y), len(x), n_species), dtype=np.float32)
+    print("  Separating West/East boundaries...")
+    left_mass_a = np.zeros_like(left_mass_orig_norm)
+    left_mass_b = np.zeros_like(left_mass_orig_norm)
+    right_mass_a = np.zeros_like(right_mass_orig_norm)
+    right_mass_b = np.zeros_like(right_mass_orig_norm)
     
-    # Process each time step
-    for ts in tqdm(range(len(all_ts)), desc="  Processing boundaries"):
+    for ts in tqdm(range(len(all_ts)), desc="  West/East separation", leave=False):
         for zlev in range(len(z)):
+            la, lb = create_separated_mass_fractions(left_mass_orig_norm[ts, zlev, :, :], "left")
+            left_mass_a[ts, zlev, :, :] = la
+            left_mass_b[ts, zlev, :, :] = lb
             
-            # West and East boundaries (y dimension)
-            for yidx in range(len(y)):
-                # Get WRF-Chem number concentrations
-                wrf_num_left = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-                wrf_num_right = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-                
-                for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
-                    num_var = f'num{bin_suffix}'
-                    if num_var in ds_palm_we.data_vars:
-                        wrf_num_left[wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=0, y=yidx).data
-                        wrf_num_right[wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=-1, y=yidx).data
-                
-                # Distribute to PALM bins
-                for pbin in range(nbins):
-                    left_total = 0
-                    right_total = 0
-                    for wbin in range(len(WRFCHEM_BIN_SUFFIXES)):
-                        left_total += wrf_num_left[wbin] * overlap_ratio[pbin, wbin]
-                        right_total += wrf_num_right[wbin] * overlap_ratio[pbin, wbin]
-                    left_aerosol[ts, zlev, yidx, pbin] = left_total
-                    right_aerosol[ts, zlev, yidx, pbin] = right_total
-                
-                # Mass fractions for left boundary
-                total_mass_left = 0
-                spec_mass_left = np.zeros(n_species)
-                
-                for idx, spec in enumerate(listspec):
-                    mass_val = 0
-                    wrfchem_names = get_wrfchem_variables_for_species(spec)
-                    for wrfchem_name in wrfchem_names:
-                        for bin_suffix in WRFCHEM_BIN_SUFFIXES:
-                            var_name = f'{wrfchem_name}{bin_suffix}'
-                            if var_name in ds_palm_we.data_vars:
-                                mass_val += ds_palm_we[var_name].isel(time=ts, z=zlev, x=0, y=yidx).data
-                    spec_mass_left[idx] = mass_val
-                    total_mass_left += mass_val
-                
-                if total_mass_left > 0:
-                    left_mass_a[ts, zlev, yidx, :] = spec_mass_left / total_mass_left
-                
-                # Mass fractions for right boundary
-                total_mass_right = 0
-                spec_mass_right = np.zeros(n_species)
-                
-                for idx, spec in enumerate(listspec):
-                    mass_val = 0
-                    wrfchem_names = get_wrfchem_variables_for_species(spec)
-                    for wrfchem_name in wrfchem_names:
-                        for bin_suffix in WRFCHEM_BIN_SUFFIXES:
-                            var_name = f'{wrfchem_name}{bin_suffix}'
-                            if var_name in ds_palm_we.data_vars:
-                                mass_val += ds_palm_we[var_name].isel(time=ts, z=zlev, x=-1, y=yidx).data
-                    spec_mass_right[idx] = mass_val
-                    total_mass_right += mass_val
-                
-                if total_mass_right > 0:
-                    right_mass_a[ts, zlev, yidx, :] = spec_mass_right / total_mass_right
+            ra, rb = create_separated_mass_fractions(right_mass_orig_norm[ts, zlev, :, :], "right")
+            right_mass_a[ts, zlev, :, :] = ra
+            right_mass_b[ts, zlev, :, :] = rb
+    
+    print("  Separating South/North boundaries...")
+    south_mass_a = np.zeros_like(south_mass_orig_norm)
+    south_mass_b = np.zeros_like(south_mass_orig_norm)
+    north_mass_a = np.zeros_like(north_mass_orig_norm)
+    north_mass_b = np.zeros_like(north_mass_orig_norm)
+    
+    for ts in tqdm(range(len(all_ts)), desc="  South/North separation", leave=False):
+        for zlev in range(len(z)):
+            sa, sb = create_separated_mass_fractions(south_mass_orig_norm[ts, zlev, :, :], "south")
+            south_mass_a[ts, zlev, :, :] = sa
+            south_mass_b[ts, zlev, :, :] = sb
             
-            # South and North boundaries (x dimension)
-            for xidx in range(len(x)):
-                # Get WRF-Chem number concentrations
-                wrf_num_south = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-                wrf_num_north = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-                
-                for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
-                    num_var = f'num{bin_suffix}'
-                    if num_var in ds_palm_sn.data_vars:
-                        wrf_num_south[wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=0, x=xidx).data
-                        wrf_num_north[wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=-1, x=xidx).data
-                
-                # Distribute to PALM bins
-                for pbin in range(nbins):
-                    south_total = 0
-                    north_total = 0
-                    for wbin in range(len(WRFCHEM_BIN_SUFFIXES)):
-                        south_total += wrf_num_south[wbin] * overlap_ratio[pbin, wbin]
-                        north_total += wrf_num_north[wbin] * overlap_ratio[pbin, wbin]
-                    south_aerosol[ts, zlev, xidx, pbin] = south_total
-                    north_aerosol[ts, zlev, xidx, pbin] = north_total
-                
-                # Mass fractions for south boundary
-                total_mass_south = 0
-                spec_mass_south = np.zeros(n_species)
-                
-                for idx, spec in enumerate(listspec):
-                    mass_val = 0
-                    wrfchem_names = get_wrfchem_variables_for_species(spec)
-                    for wrfchem_name in wrfchem_names:
-                        for bin_suffix in WRFCHEM_BIN_SUFFIXES:
-                            var_name = f'{wrfchem_name}{bin_suffix}'
-                            if var_name in ds_palm_sn.data_vars:
-                                mass_val += ds_palm_sn[var_name].isel(time=ts, z=zlev, y=0, x=xidx).data
-                    spec_mass_south[idx] = mass_val
-                    total_mass_south += mass_val
-                
-                if total_mass_south > 0:
-                    south_mass_a[ts, zlev, xidx, :] = spec_mass_south / total_mass_south
-                
-                # Mass fractions for north boundary
-                total_mass_north = 0
-                spec_mass_north = np.zeros(n_species)
-                
-                for idx, spec in enumerate(listspec):
-                    mass_val = 0
-                    wrfchem_names = get_wrfchem_variables_for_species(spec)
-                    for wrfchem_name in wrfchem_names:
-                        for bin_suffix in WRFCHEM_BIN_SUFFIXES:
-                            var_name = f'{wrfchem_name}{bin_suffix}'
-                            if var_name in ds_palm_sn.data_vars:
-                                mass_val += ds_palm_sn[var_name].isel(time=ts, z=zlev, y=-1, x=xidx).data
-                    spec_mass_north[idx] = mass_val
-                    total_mass_north += mass_val
-                
-                if total_mass_north > 0:
-                    north_mass_a[ts, zlev, xidx, :] = spec_mass_north / total_mass_north
-        
-        # Top boundary
-        for yidx in range(len(y)):
-            for xidx in range(len(x)):
-                # Get WRF-Chem number concentrations at top
-                wrf_num_top = np.zeros(len(WRFCHEM_BIN_SUFFIXES))
-                for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
-                    num_var = f'num{bin_suffix}'
-                    if num_var in chem_top:
-                        wrf_num_top[wbin] = chem_top[num_var][ts, yidx, xidx]
-                
-                # Distribute to PALM bins
-                for pbin in range(nbins):
-                    top_total = 0
-                    for wbin in range(len(WRFCHEM_BIN_SUFFIXES)):
-                        top_total += wrf_num_top[wbin] * overlap_ratio[pbin, wbin]
-                    top_aerosol[ts, yidx, xidx, pbin] = top_total
-                
-                # Mass fractions for top boundary
-                total_mass_top = 0
-                spec_mass_top = np.zeros(n_species)
-                
-                for idx, spec in enumerate(listspec):
-                    mass_val = 0
-                    wrfchem_names = get_wrfchem_variables_for_species(spec)
-                    for wrfchem_name in wrfchem_names:
-                        for bin_suffix in WRFCHEM_BIN_SUFFIXES:
-                            var_name = f'{wrfchem_name}{bin_suffix}'
-                            if var_name in chem_top:
-                                mass_val += chem_top[var_name][ts, yidx, xidx]
-                    spec_mass_top[idx] = mass_val
-                    total_mass_top += mass_val
-                
-                if total_mass_top > 0:
-                    top_mass_a[ts, yidx, xidx, :] = spec_mass_top / total_mass_top
+            na, nb = create_separated_mass_fractions(north_mass_orig_norm[ts, zlev, :, :], "north")
+            north_mass_a[ts, zlev, :, :] = na
+            north_mass_b[ts, zlev, :, :] = nb
     
-    # Apply nf2a factor to split soluble/insoluble
-    if nf2a == 1.0:
-        left_mass_b = np.zeros_like(left_mass_a)
-        right_mass_b = np.zeros_like(right_mass_a)
-        south_mass_b = np.zeros_like(south_mass_a)
-        north_mass_b = np.zeros_like(north_mass_a)
-        top_mass_b = np.zeros_like(top_mass_a)
-        mass_fracs_b_init = np.zeros_like(mass_fracs_a_init)
-    elif nf2a < 1.0:
-        left_mass_b = (1 - nf2a) * left_mass_a
-        right_mass_b = (1 - nf2a) * right_mass_a
-        south_mass_b = (1 - nf2a) * south_mass_a
-        north_mass_b = (1 - nf2a) * north_mass_a
-        top_mass_b = (1 - nf2a) * top_mass_a
-        mass_fracs_b_init = (1 - nf2a) * mass_fracs_a_init.copy()
-        left_mass_a = nf2a * left_mass_a
-        right_mass_a = nf2a * right_mass_a
-        south_mass_a = nf2a * south_mass_a
-        north_mass_a = nf2a * north_mass_a
-        top_mass_a = nf2a * top_mass_a
-        mass_fracs_a_init = nf2a * mass_fracs_a_init
-    else:
-        print("Warning: nf2a > 1.0 is invalid, setting to 1.0")
-        left_mass_b = np.zeros_like(left_mass_a)
-        right_mass_b = np.zeros_like(right_mass_a)
-        south_mass_b = np.zeros_like(south_mass_a)
-        north_mass_b = np.zeros_like(north_mass_a)
-        top_mass_b = np.zeros_like(top_mass_a)
-        mass_fracs_b_init = np.zeros_like(mass_fracs_a_init)
+    print("  Separating Top boundary...")
+    top_mass_a = np.zeros_like(top_mass_orig_norm)
+    top_mass_b = np.zeros_like(top_mass_orig_norm)
     
-    # Store updated mass fractions in chem_init
-    chem_init['mass_fracs_a'] = xr.DataArray(mass_fracs_a_init, dims=['z', 'composition_index'])
-    chem_init['mass_fracs_b'] = xr.DataArray(mass_fracs_b_init, dims=['z', 'composition_index'])
+    for ts in tqdm(range(len(all_ts)), desc="  Top separation", leave=False):
+        orig_shape = top_mass_orig_norm[ts, :, :, :].shape
+        flat_mass = top_mass_orig_norm[ts, :, :, :].reshape(-1, n_species)
+        flat_a, flat_b = create_separated_mass_fractions(flat_mass, "top")
+        top_mass_a[ts, :, :, :] = flat_a.reshape(orig_shape)
+        top_mass_b[ts, :, :, :] = flat_b.reshape(orig_shape)
     
-    # Store boundary arrays for output
+    # ===== STEP 4: Store Boundary Data =====
     aerosol_boundary_data = {
         'left': left_aerosol, 'right': right_aerosol,
         'south': south_aerosol, 'north': north_aerosol, 'top': top_aerosol,
@@ -1197,28 +1482,117 @@ if aerosol_wrfchem:
         'south_mass_b': south_mass_b, 'north_mass_b': north_mass_b, 'top_mass_b': top_mass_b
     }
     
-    # Print statistics to verify bin distribution
+    # ===== STEP 5: Final Verification =====
     print("\n" + "="*60)
     print("AEROSOL PROCESSING COMPLETE - Verification")
     print("="*60)
-    print("Initial aerosol concentration per bin (average over first 5 vertical levels):")
-    for bin_idx in range(nbins):
+    print(f"nf2a = {nf2a}")
+    print(f"\nSpecies classification used:")
+    print(f"  Insoluble: {INSOLUBLE_SPECIES}")
+    print(f"  Soluble:   {SOLUBLE_SPECIES}")
+    
+    print(f"\nInitial aerosol concentration per bin (average over first 5 vertical levels):")
+    for bin_idx in range(min(nbins_total, 17)):
         bin_mean = np.mean(aerosol_concentration_init[:5, bin_idx])
         bin_std = np.std(aerosol_concentration_init[:5, bin_idx])
-        print(f"  Bin {bin_idx+1} (d={dmid[bin_idx]*1e9:.1f} nm): mean={bin_mean:.2e} #/m³, std={bin_std:.2e}")
+        print(f"  Bin {bin_idx+1:2d} (d={dmid_all[bin_idx]*1e9:.1f} nm): mean={bin_mean:.2e} #/m3, std={bin_std:.2e}")
     
     if len(np.unique(aerosol_concentration_init[0, :])) == 1:
-        print("\n⚠️  WARNING: All bins have the same value! Check overlap_ratio calculation.")
-        print(f"  overlap_ratio shape: {overlap_ratio.shape}")
-        print(f"  Sample overlap_ratio row 0: {overlap_ratio[0, :]}")
+        print("\nWARNING: All bins have the same value! Check overlap_ratio calculation.")
     else:
-        print("\n✅ Bins have different values - size distribution preserved!")
+        print("\nBins have different values - size distribution preserved!")
     
+    print(f"\nFinal composition check (top boundary, t=0, spatial average):")
+    print(f"  mass_fracs_a sum: {np.mean(np.sum(top_mass_a[0, :, :, :], axis=-1)):.6f}")
+    print(f"  mass_fracs_b sum: {np.mean(np.sum(top_mass_b[0, :, :, :], axis=-1)):.6f}")
     print("="*60)
 
-#-------------------------------------------------------------------------------
-# Process radiation data from WRF
-#-------------------------------------------------------------------------------
+# check the trace metal values
+if trace_metal_added:
+    print("\n  " + "="*70)
+    print("  TRACE METAL INITIAL PROFILE VALUES (DYNAMIC PM2.5 SCALING)")
+    print("  " + "="*70)
+    
+    if 'PM2_5_DRY' in chem_init:
+        pm25_profile = chem_init['PM2_5_DRY'].values
+        print(f"\n  PM2.5 range: {np.min(pm25_profile):.2f} - {np.max(pm25_profile):.2f} μg/m³")
+    
+    print(f"\n  Trace Metal Concentrations:")
+    print(f"  {'z':<6} {'PM2.5':<10} ", end="")
+    for spec in listspec:
+        if is_trace_metal(spec):
+            print(f"{spec}(ng)   {spec}(μg)   ", end="")
+    print()
+    print("  " + "-"*80)
+    
+    z_indices = [0, 1, 2, 3, 4, -1]
+    for z_idx in z_indices:
+        if z_idx < len(z):
+            pm25_val = pm25_profile[z_idx] if 'PM2_5_DRY' in chem_init else 0
+            print(f"  {z_idx:<6} {pm25_val:<10.2f} ", end="")
+            for idx, spec in enumerate(listspec):
+                if is_trace_metal(spec):
+                    trace_ug = mass_matrix[z_idx, idx]  # μg/m³
+                    trace_ng = trace_ug * 1000  # ng/m³
+                    print(f"{trace_ng:<8.2f}  {trace_ug:<8.4f} ", end="")
+            print()
+    
+# ===== SMART TRACE METAL VERIFICATION (With Adaptive Precision) =====
+if aerosol_wrfchem:
+    available_trace_metals = [s for s in listspec if is_trace_metal(s)]
+    
+    if len(available_trace_metals) > 0 and 'PM2_5_DRY' in ds_palm_we.data_vars:
+        print("\n  " + "="*60)
+        print("  TRACE METAL VERIFICATION")
+        print("  " + "="*60)
+        
+        y_mid, x_mid = len(y)//2, len(x)//2
+        
+        for spec in available_trace_metals:
+            idx = listspec.index(spec)
+            
+            init_val = mass_matrix[0, idx] * 1000
+            west_val = left_mass_orig[0, 0, y_mid, idx] * 1000
+            east_val = right_mass_orig[0, 0, y_mid, idx] * 1000
+            top_val = top_mass_orig[0, y_mid, x_mid, idx] * 1000
+            
+            # ADAPTIVE PRECISION based on value magnitude
+            max_val = max(init_val, west_val, east_val, top_val)
+            if max_val < 0.1:
+                precision = 3  # Show 3 decimal places for very small values
+            elif max_val < 1.0:
+                precision = 2  # Show 2 decimal places for small values
+            else:
+                precision = 2  # Show 2 decimal places for normal values
+            
+            format_str = f"{{:.{precision}f}}"
+            
+            init_str = format_str.format(init_val)
+            west_str = format_str.format(west_val)
+            east_str = format_str.format(east_val)
+            top_str = format_str.format(top_val)
+            
+            print(f"\n  {spec}: Init={init_str}, West={west_str}, East={east_str}, Top={top_str} ng/m³")
+            
+            # Check if values vary (using higher precision for comparison)
+            vals = [init_val, west_val, east_val, top_val]
+            # Use relative tolerance for small values
+            if max_val < 0.1:
+                unique_count = len(set([f"{v:.3f}" for v in vals]))
+            else:
+                unique_count = len(set([f"{v:.2f}" for v in vals]))
+            
+            if unique_count > 1:
+                print(f"   Values VARY - dynamic scaling working!")
+            else:
+                print(f"   Values appear constant (may be due to rounding of very small values)")
+        
+        print(f"\n  Available trace metals: {available_trace_metals}")
+        print("  " + "="*60)
+
+#===============================================================================
+# Process Radiation Data
+#===============================================================================
 rad_times_sec = []
 rad_values_proc = [[], [], []]
 
@@ -1231,57 +1605,50 @@ if radiation_from_wrf:
     
     if radiation_vars_exist:
         rad_times_sec = times_sec
+        rad_swdown, rad_lwdown, rad_swdiff = [], [], []
+        wrf_times = ds_wrf.time.values
         
-        n_wrf_x = east_idx - west_idx + 1
-        n_wrf_y = north_idx - south_idx + 1
-        ngrids = n_wrf_x * n_wrf_y
+        for ts in tqdm(range(len(all_ts)), desc="Radiation"):
+            current_time = all_ts[ts]
+            closest_idx = np.argmin(np.abs(wrf_times - current_time))
+            
+            sw_cropped = ds_wrf['SWDOWN'].isel(
+                time=closest_idx,
+                west_east=slice(west_idx, east_idx + 1),
+                south_north=slice(south_idx, north_idx + 1)
+            ).values.astype(np.float32)
+            
+            lw_cropped = ds_wrf['GLW'].isel(
+                time=closest_idx,
+                west_east=slice(west_idx, east_idx + 1),
+                south_north=slice(south_idx, north_idx + 1)
+            ).values.astype(np.float32)
+            
+            dif_cropped = ds_wrf['SWDDIF'].isel(
+                time=closest_idx,
+                west_east=slice(west_idx, east_idx + 1),
+                south_north=slice(south_idx, north_idx + 1)
+            ).values.astype(np.float32)
+            
+            rad_swdown.append(np.mean(sw_cropped))
+            rad_lwdown.append(np.mean(lw_cropped))
+            rad_swdiff.append(np.mean(dif_cropped))
         
-        if ngrids > 0:
-            rad_swdown, rad_lwdown, rad_swdiff = [], [], []
-            wrf_times = ds_wrf.time.values
-            
-            for ts in tqdm(range(len(all_ts)), desc="Radiation processing", unit="timestep"):
-                current_time = all_ts[ts]
-                time_diffs = np.abs(wrf_times - current_time)
-                closest_idx = np.argmin(time_diffs)
-                
-                sw_cropped = ds_wrf['SWDOWN'].isel(
-                    time=closest_idx,
-                    west_east=slice(west_idx, east_idx + 1),
-                    south_north=slice(south_idx, north_idx + 1)
-                ).values
-                
-                lw_cropped = ds_wrf['GLW'].isel(
-                    time=closest_idx,
-                    west_east=slice(west_idx, east_idx + 1),
-                    south_north=slice(south_idx, north_idx + 1)
-                ).values
-                
-                dif_cropped = ds_wrf['SWDDIF'].isel(
-                    time=closest_idx,
-                    west_east=slice(west_idx, east_idx + 1),
-                    south_north=slice(south_idx, north_idx + 1)
-                ).values
-                
-                rad_swdown.append(np.mean(sw_cropped))
-                rad_lwdown.append(np.mean(lw_cropped))
-                rad_swdiff.append(np.mean(dif_cropped))
-            
-            rad_values_proc = [rad_swdown, rad_lwdown, rad_swdiff]
+        rad_values_proc = [rad_swdown, rad_lwdown, rad_swdiff]
+        print("Radiation data processed successfully")
     else:
-        rad_times_sec = []
-        rad_values_proc = [[], [], []]
+        print("Radiation variables not found in WRF output")
 else:
-    rad_times_sec = []
-    rad_values_proc = [[], [], []]
+    print("Radiation from WRF disabled")
 
 print("\n" + "="*60)
 
-#-------------------------------------------------------------------------------
-# Output NetCDF file
-#-------------------------------------------------------------------------------
+#===============================================================================
+# Output NetCDF File
+#===============================================================================
+print("Preparing NetCDF file...")
+
 nc_output_name = f'dynamic_files/{case_name}_dynamic_{start_year}_{start_month}_{start_day}_{start_hour}'
-print('Writing NetCDF file', flush=True)
 nc_output = xr.Dataset()
 res_origin = str(dx) + 'x' + str(dy) + ' m'
 
@@ -1300,33 +1667,6 @@ nc_output.attrs['rotation_angle'] = float(0)
 nc_output.attrs['origin_time'] = str(all_ts[0]) + ' UTC'
 nc_output.attrs['end_time'] = str(all_ts[-1]) + ' UTC'
 
-# Add aerosol-related global attributes if aerosol processing is enabled
-if aerosol_wrfchem:
-    dmid, bin_limits = define_bins(nbin, reglim)
-    bin_sizes_str = ', '.join([f'{d:.3e}' for d in dmid])
-    nc_output.attrs['aerosol_bin_sizes_m'] = bin_sizes_str
-    nc_output.attrs['aerosol_bin_sizes_description'] = 'Geometric mean diameters of aerosol bins'
-    
-    reglim_str = ', '.join([f'{r:.3e}' for r in reglim])
-    nc_output.attrs['aerosol_reglim_m'] = reglim_str
-    nc_output.attrs['aerosol_reglim_description'] = 'Aerosol bin limits for PALM SALSA scheme'
-    
-    listspec_str = ', '.join(listspec)
-    nc_output.attrs['aerosol_species_order'] = listspec_str
-    nc_output.attrs['aerosol_species_description'] = 'Order of aerosol chemical components'
-    
-    nbin_str = f'{nbin[0]}, {nbin[1]}' if len(nbin) == 2 else str(nbin)
-    nc_output.attrs['aerosol_nbin'] = nbin_str
-    nc_output.attrs['aerosol_nbin_description'] = 'Number of bins in each subrange'
-    
-    nc_output.attrs['aerosol_nf2a'] = str(nf2a)
-    nc_output.attrs['aerosol_nf2a_description'] = 'Soluble/insoluble fraction factor'
-    
-    if 'wrfchem_bin_limits' in locals():
-        wrfchem_limits_str = ', '.join([f'{l:.3e}' for l in wrfchem_bin_limits])
-        nc_output.attrs['wrfchem_bin_limits_m'] = wrfchem_limits_str
-        nc_output.attrs['wrfchem_bin_limits_description'] = 'WRF-Chem aerosol bin limits'
-
 # Add coordinates
 nc_output['x'] = xr.DataArray(x, dims=['x'], attrs={'units': 'm'})
 nc_output['y'] = xr.DataArray(y, dims=['y'], attrs={'units': 'm'})
@@ -1337,401 +1677,379 @@ nc_output['yv'] = xr.DataArray(yv, dims=['yv'], attrs={'units': 'm'})
 nc_output['zw'] = xr.DataArray(zw - z_origin, dims=['zw'], attrs={'units': 'm'})
 nc_output['time'] = xr.DataArray(times_sec, dims=['time'], attrs={'units': 'seconds'})
 
-nc_output.to_netcdf(nc_output_name)
-
 # Soil variables
-nc_output['init_soil_m'] = xr.DataArray(init_msoil, dims=['zsoil', 'y', 'x'],
-    attrs={'units': 'm^3/m^3', 'lod': np.int32(2), 'source': 'WRF', 'long_name': 'volumetric soil moisture'})
-nc_output['init_soil_t'] = xr.DataArray(init_tsoil, dims=['zsoil', 'y', 'x'],
-    attrs={'units': 'K', 'lod': np.int32(2), 'source': 'WRF', 'long_name': 'soil temperature'})
+nc_output['init_soil_m'] = xr.DataArray(init_msoil.astype(np.float32), dims=['zsoil', 'y', 'x'],
+    attrs={'units': 'm3/m3', 'source': 'WRF', 'long_name': 'volumetric soil moisture', 'lod': np.int32(2)})
+
+nc_output['init_soil_t'] = xr.DataArray(init_tsoil.astype(np.float32), dims=['zsoil', 'y', 'x'],
+    attrs={'units': 'K', 'source': 'WRF', 'long_name': 'soil temperature', 'lod': np.int32(2)})
 
 # Meteorological variables
-nc_output['init_atmosphere_pt'] = xr.DataArray(pt_init, dims=['z'],
-    attrs={'units': 'K', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_left_pt'] = xr.DataArray(ds_palm_we["pt"][:, :, :, 0].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'K', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_right_pt'] = xr.DataArray(ds_palm_we["pt"][:, :, :, -1].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'K', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_south_pt'] = xr.DataArray(ds_palm_sn["pt"][:, :, 0, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'K', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_north_pt'] = xr.DataArray(ds_palm_sn["pt"][:, :, -1, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'K', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_top_pt'] = xr.DataArray(pt_top[:, :, :], dims=['time', 'y', 'x'],
-    attrs={'units': 'K', 'source': 'WRF', 'res_origin': res_origin})
+met_vars_output = [
+    ('init_atmosphere_pt', pt_init.astype(np.float32), ['z'], {'units': 'K', 'lod': np.int32(1)}),
+    ('ls_forcing_left_pt', ds_palm_we["pt"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'K'}),
+    ('ls_forcing_right_pt', ds_palm_we["pt"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'K'}),
+    ('ls_forcing_south_pt', ds_palm_sn["pt"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'K'}),
+    ('ls_forcing_north_pt', ds_palm_sn["pt"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'K'}),
+    ('ls_forcing_top_pt', pt_top.astype(np.float32), ['time', 'y', 'x'], {'units': 'K'}),
+    ('init_atmosphere_qv', qv_init.astype(np.float32), ['z'], {'units': 'kg/kg', 'lod': np.int32(1)}),
+    ('ls_forcing_left_qv', ds_palm_we["QVAPOR"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'kg/kg'}),
+    ('ls_forcing_right_qv', ds_palm_we["QVAPOR"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'kg/kg'}),
+    ('ls_forcing_south_qv', ds_palm_sn["QVAPOR"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'kg/kg'}),
+    ('ls_forcing_north_qv', ds_palm_sn["QVAPOR"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'kg/kg'}),
+    ('ls_forcing_top_qv', qv_top.astype(np.float32), ['time', 'y', 'x'], {'units': 'kg/kg'}),
+    ('init_atmosphere_u', u_init.astype(np.float32), ['z'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('ls_forcing_left_u', ds_palm_we["U"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'm/s'}),
+    ('ls_forcing_right_u', ds_palm_we["U"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'm/s'}),
+    ('ls_forcing_south_u', ds_palm_sn["U"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'xu'], {'units': 'm/s'}),
+    ('ls_forcing_north_u', ds_palm_sn["U"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'xu'], {'units': 'm/s'}),
+    ('ls_forcing_top_u', u_top.astype(np.float32), ['time', 'y', 'xu'], {'units': 'm/s'}),
+    ('init_atmosphere_v', v_init.astype(np.float32), ['z'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('ls_forcing_left_v', ds_palm_we["V"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'yv'], {'units': 'm/s'}),
+    ('ls_forcing_right_v', ds_palm_we["V"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'yv'], {'units': 'm/s'}),
+    ('ls_forcing_south_v', ds_palm_sn["V"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'm/s'}),
+    ('ls_forcing_north_v', ds_palm_sn["V"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'm/s'}),
+    ('ls_forcing_top_v', v_top.astype(np.float32), ['time', 'yv', 'x'], {'units': 'm/s'}),
+    ('init_atmosphere_w', w_init.astype(np.float32), ['zw'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('ls_forcing_left_w', ds_palm_we["W"][:, :, :, 0].data.astype(np.float32), ['time', 'zw', 'y'], {'units': 'm/s'}),
+    ('ls_forcing_right_w', ds_palm_we["W"][:, :, :, -1].data.astype(np.float32), ['time', 'zw', 'y'], {'units': 'm/s'}),
+    ('ls_forcing_south_w', ds_palm_sn["W"][:, :, 0, :].data.astype(np.float32), ['time', 'zw', 'x'], {'units': 'm/s'}),
+    ('ls_forcing_north_w', ds_palm_sn["W"][:, :, -1, :].data.astype(np.float32), ['time', 'zw', 'x'], {'units': 'm/s'}),
+    ('ls_forcing_top_w', w_top.astype(np.float32), ['time', 'y', 'x'], {'units': 'm/s'}),
+    ('surface_forcing_surface_pressure', surface_pres.data.astype(np.float32), ['time'], {'units': 'Pa', 'lod': np.int32(1)}),
+]
 
-nc_output['init_atmosphere_qv'] = xr.DataArray(qv_init, dims=['z'],
-    attrs={'units': 'kg/kg', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_left_qv'] = xr.DataArray(ds_palm_we["QVAPOR"][:, :, :, 0].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'kg/kg', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_right_qv'] = xr.DataArray(ds_palm_we["QVAPOR"][:, :, :, -1].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'kg/kg', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_south_qv'] = xr.DataArray(ds_palm_sn["QVAPOR"][:, :, 0, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'kg/kg', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_north_qv'] = xr.DataArray(ds_palm_sn["QVAPOR"][:, :, -1, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'kg/kg', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_top_qv'] = xr.DataArray(qv_top[:, :, :], dims=['time', 'y', 'x'],
-    attrs={'units': 'kg/kg', 'source': 'WRF', 'res_origin': res_origin})
+for var_name, data, dims, attrs in met_vars_output:
+    nc_output[var_name] = xr.DataArray(data, dims=dims, attrs=attrs)
 
-nc_output['init_atmosphere_u'] = xr.DataArray(u_init, dims=['z'],
-    attrs={'units': 'm/s', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_left_u'] = xr.DataArray(ds_palm_we["U"][:, :, :, 0].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_right_u'] = xr.DataArray(ds_palm_we["U"][:, :, :, -1].data, dims=['time', 'z', 'y'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_south_u'] = xr.DataArray(ds_palm_sn["U"][:, :, 0, :].data, dims=['time', 'z', 'xu'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_north_u'] = xr.DataArray(ds_palm_sn["U"][:, :, -1, :].data, dims=['time', 'z', 'xu'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_top_u'] = xr.DataArray(u_top[:, :, :], dims=['time', 'y', 'xu'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-
-nc_output['init_atmosphere_v'] = xr.DataArray(v_init, dims=['z'],
-    attrs={'units': 'm/s', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_left_v'] = xr.DataArray(ds_palm_we["V"][:, :, :, 0].data, dims=['time', 'z', 'yv'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_right_v'] = xr.DataArray(ds_palm_we["V"][:, :, :, -1].data, dims=['time', 'z', 'yv'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_south_v'] = xr.DataArray(ds_palm_sn["V"][:, :, 0, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_north_v'] = xr.DataArray(ds_palm_sn["V"][:, :, -1, :].data, dims=['time', 'z', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_top_v'] = xr.DataArray(v_top[:, :, :], dims=['time', 'yv', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-
-nc_output['init_atmosphere_w'] = xr.DataArray(w_init, dims=['zw'],
-    attrs={'units': 'm/s', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_left_w'] = xr.DataArray(ds_palm_we["W"][:, :, :, 0].data, dims=['time', 'zw', 'y'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_right_w'] = xr.DataArray(ds_palm_we["W"][:, :, :, -1].data, dims=['time', 'zw', 'y'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_south_w'] = xr.DataArray(ds_palm_sn["W"][:, :, 0, :].data, dims=['time', 'zw', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_north_w'] = xr.DataArray(ds_palm_sn["W"][:, :, -1, :].data, dims=['time', 'zw', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-nc_output['ls_forcing_top_w'] = xr.DataArray(w_top[:, :, :], dims=['time', 'y', 'x'],
-    attrs={'units': 'm/s', 'source': 'WRF', 'res_origin': res_origin})
-
-nc_output['surface_forcing_surface_pressure'] = xr.DataArray(surface_pres.data, dims=['time'],
-    attrs={'units': 'Pa', 'lod': np.int32(1), 'source': 'WRF', 'res_origin': res_origin})
-
-# Add chemistry species to output
+# Chemistry species output
 MICROGRAM_TO_KG = 1e-9
-
 chem_name_mapping = {
     "hno3": "HNO3", "ho2": "HO2", "ho": "OH", "no2": "NO2", "o3": "O3",
-    "no": "NO", "qvapor": "H2O", "nh3": "NH3", "so2": "SO2", "co": "CO",
-    "sulf": "H2SO4", "RH": "RH", "RO2": "RO2", "RCHO": "RCHO",
-    "OCSV": "OCSV", "OCNV": "OCNV", "PM10": "PM10", "PM2_5_DRY": "PM25"
+    "no": "NO", "nh3": "NH3", "so2": "SO2", "co": "CO", "sulf": "H2SO4",
+    "RH": "RH", "RO2": "RO2", "RCHO": "RCHO", "PM10": "PM10", "PM2_5_DRY": "PM25"
 }
 
 for species in original_chem_species:
+    # Determine output name
     if species.endswith('_traffic'):
         base = species.replace('_traffic', '')
         if base in chem_name_mapping:
-            output_species_name = f"{chem_name_mapping[base]}_traffic"
+            output_name = f"{chem_name_mapping[base]}_traffic"
         else:
-            output_species_name = f"{base.upper()}_traffic"
+            output_name = f"{base.upper()}_traffic"
     else:
-        output_species_name = chem_name_mapping.get(species, species.upper())
+        output_name = chem_name_mapping.get(species, species.upper())
     
+    # Determine units based on species (including traffic versions)
     if species in chem_init:
-        if species in ['PM10', 'PM2_5_DRY']:
-            converted_data = chem_init[species].data * MICROGRAM_TO_KG
-            nc_output[f'init_atmosphere_{output_species_name}'] = xr.DataArray(converted_data, dims=['z'],
-                attrs={'units': 'kg/m3', 'lod': np.int32(1), 'source': 'WRF-Chem', 'res_origin': res_origin})
+        # Check for PM10 and PM2.5 (including traffic versions)
+        if species in ['PM10', 'PM2_5_DRY'] or species.replace('_traffic', '') in ['PM10', 'PM2_5_DRY']:
+            data = chem_init[species].data * MICROGRAM_TO_KG
+            units = 'kg/m3'
         else:
-            nc_output[f'init_atmosphere_{output_species_name}'] = xr.DataArray(chem_init[species].data, dims=['z'],
-                attrs={'units': 'ppm', 'lod': np.int32(1), 'source': 'WRF-Chem', 'res_origin': res_origin})
+            data = chem_init[species].data
+            units = 'ppm'
+        
+        nc_output[f'init_atmosphere_{output_name}'] = xr.DataArray(data.astype(np.float32), dims=['z'], 
+            attrs={'units': units, 'source': 'WRF-Chem', 'lod': np.int32(1)})
     
     if species in ds_palm_we.data_vars:
-        if species in ['PM10', 'PM2_5_DRY']:
+        # Check for PM10 and PM2.5 (including traffic versions)
+        if species in ['PM10', 'PM2_5_DRY'] or species.replace('_traffic', '') in ['PM10', 'PM2_5_DRY']:
             left_data = ds_palm_we[species][:, :, :, 0].data * MICROGRAM_TO_KG
             right_data = ds_palm_we[species][:, :, :, -1].data * MICROGRAM_TO_KG
             south_data = ds_palm_sn[species][:, :, 0, :].data * MICROGRAM_TO_KG
             north_data = ds_palm_sn[species][:, :, -1, :].data * MICROGRAM_TO_KG
             top_data = chem_top[species] * MICROGRAM_TO_KG
-            unit = "kg/m3"
+            units = 'kg/m3'
         else:
             left_data = ds_palm_we[species][:, :, :, 0].data
             right_data = ds_palm_we[species][:, :, :, -1].data
             south_data = ds_palm_sn[species][:, :, 0, :].data
             north_data = ds_palm_sn[species][:, :, -1, :].data
             top_data = chem_top[species]
-            unit = "ppm"
+            units = 'ppm'
         
-        nc_output[f'ls_forcing_left_{output_species_name}'] = xr.DataArray(left_data, dims=['time', 'z', 'y'],
-            attrs={'units': unit, 'source': 'WRF-Chem', 'res_origin': res_origin})
-        nc_output[f'ls_forcing_right_{output_species_name}'] = xr.DataArray(right_data, dims=['time', 'z', 'y'],
-            attrs={'units': unit, 'source': 'WRF-Chem', 'res_origin': res_origin})
-        nc_output[f'ls_forcing_south_{output_species_name}'] = xr.DataArray(south_data, dims=['time', 'z', 'x'],
-            attrs={'units': unit, 'source': 'WRF-Chem', 'res_origin': res_origin})
-        nc_output[f'ls_forcing_north_{output_species_name}'] = xr.DataArray(north_data, dims=['time', 'z', 'x'],
-            attrs={'units': unit, 'source': 'WRF-Chem', 'res_origin': res_origin})
-        nc_output[f'ls_forcing_top_{output_species_name}'] = xr.DataArray(top_data, dims=['time', 'y', 'x'],
-            attrs={'units': unit, 'source': 'WRF-Chem', 'res_origin': res_origin})
+        nc_output[f'ls_forcing_left_{output_name}'] = xr.DataArray(left_data.astype(np.float32), dims=['time', 'z', 'y'], 
+            attrs={'units': units, 'source': 'WRF-Chem'})
+        nc_output[f'ls_forcing_right_{output_name}'] = xr.DataArray(right_data.astype(np.float32), dims=['time', 'z', 'y'], 
+            attrs={'units': units, 'source': 'WRF-Chem'})
+        nc_output[f'ls_forcing_south_{output_name}'] = xr.DataArray(south_data.astype(np.float32), dims=['time', 'z', 'x'], 
+            attrs={'units': units, 'source': 'WRF-Chem'})
+        nc_output[f'ls_forcing_north_{output_name}'] = xr.DataArray(north_data.astype(np.float32), dims=['time', 'z', 'x'], 
+            attrs={'units': units, 'source': 'WRF-Chem'})
+        nc_output[f'ls_forcing_top_{output_name}'] = xr.DataArray(top_data.astype(np.float32), dims=['time', 'y', 'x'], 
+            attrs={'units': units, 'source': 'WRF-Chem'})
 
-#-------------------------------------------------------------------------------
-# Aerosol output
-#-------------------------------------------------------------------------------
-if aerosol_wrfchem:
-    print("\n" + "="*60)
-    print("ADDING AEROSOL VARIABLES TO OUTPUT")
-    print("="*60)
+# ===== AEROSOL OUTPUT =====
+if aerosol_wrfchem and 'aerosol_boundary_data' in locals():
+    print("\nAdding aerosol variables to output...")
     
-    # Get bin definitions
-    dmid, bin_limits = define_bins(nbin, reglim)
-    nbins = len(dmid)
+    # Get dimensions - USE dmid_all 
+    nbins = nbins_total  
     n_species = len(listspec)
-    
-    # Add Dmid dimension and variable
-    nc_output['Dmid'] = xr.DataArray(dmid.astype(np.float32), dims=['Dmid'],
-        attrs={'units': 'm', 'long_name': 'aerosol bin geometric mean diameters'})
-    print(f"  Added Dmid variable with {nbins} bins")
-    
-    # Add composition_index dimension
-    nc_output['composition_index'] = xr.DataArray(
-        np.arange(1, n_species + 1, dtype=np.int32), dims=['composition_index'],
-        attrs={'long_name': 'aerosol species index', 'units': '1'})
-    print(f"  Added composition_index with {n_species} indices")
-    
-    # Add max_string_length dimension
     max_string_length = 25
-    nc_output['max_string_length'] = xr.DataArray(
-        np.arange(1, max_string_length + 1, dtype=np.int32), dims=['max_string_length'],
-        attrs={'units': '-', 'long_name': 'maximum string length'})
     
-    # Add composition_name as character array
+    print(f"  Bins: {nbins}, Species: {n_species}")
+    
+    # Create dimensions using assign_coords - USE dmid_all!
+    nc_output = nc_output.assign_coords(
+        Dmid=('Dmid', dmid_all.astype(np.float32)),  # ← dmid_all, not dmid!
+        composition_index=('composition_index', np.arange(1, n_species + 1, dtype=np.int32)),
+        max_string_length=('max_string_length', np.arange(1, max_string_length + 1, dtype=np.int32))
+    )
+    
+    # Add attributes to dimensions
+    nc_output['Dmid'].attrs = {'units': 'm', 'long_name': 'aerosol bin geometric mean diameters'}
+    nc_output['composition_index'].attrs = {'long_name': 'aerosol species index'}
+    nc_output['max_string_length'].attrs = {'long_name': 'maximum string length'}
+    
+    # Add composition_name
     char_array = np.zeros((n_species, max_string_length), dtype='S1')
     for i, name in enumerate(listspec):
         name_bytes = name.encode('utf-8')
         name_len = min(len(name_bytes), max_string_length)
-        char_array[i, :name_len] = [bytes([b]) for b in name_bytes[:name_len]]
+        for j in range(name_len):
+            char_array[i, j] = name_bytes[j:j+1]
     
-    nc_output['composition_name'] = xr.DataArray(
-        char_array, dims=['composition_index', 'max_string_length'],
+    nc_output['composition_name'] = xr.DataArray(char_array, 
+        dims=['composition_index', 'max_string_length'],
         attrs={'long_name': 'aerosol species names', 'units': '-'})
-    print(f"  Added composition_name with species: {listspec}")
     
     # Initial profiles
     if 'mass_fracs_a' in chem_init:
         nc_output['init_atmosphere_mass_fracs_a'] = xr.DataArray(
-            chem_init['mass_fracs_a'].data, dims=['z', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'initial mass fraction - SOLUBLE components (Mode A)'})
-        print(f"  Added init_atmosphere_mass_fracs_a with shape {chem_init['mass_fracs_a'].data.shape}")
+            chem_init['mass_fracs_a'].data.astype(np.float32), 
+            dims=['z', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fractions (Mode A)', 'lod': np.int32(1)})
     
     if 'mass_fracs_b' in chem_init:
         nc_output['init_atmosphere_mass_fracs_b'] = xr.DataArray(
-            chem_init['mass_fracs_b'].data, dims=['z', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'initial mass fraction - INSOLUBLE components (Mode B)'})
-        print(f"  Added init_atmosphere_mass_fracs_b with shape {chem_init['mass_fracs_b'].data.shape}")
+            chem_init['mass_fracs_b'].data.astype(np.float32), 
+            dims=['z', 'composition_index'],
+            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fractions (Mode B)', 'lod': np.int32(1)})
     
     if 'aerosol' in chem_init:
+        # This now has shape (nz, 17) matching dmid_all
         nc_output['init_atmosphere_aerosol'] = xr.DataArray(
-            chem_init['aerosol'].data, dims=['z', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'initial aerosol number concentration per bin'})
-        print(f"  Added init_atmosphere_aerosol with shape {chem_init['aerosol'].data.shape}")
+            chem_init['aerosol'].data.astype(np.float32), 
+            dims=['z', 'Dmid'],
+            attrs={'units': '#/m3', 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration', 'lod': np.int32(1)})
     
-    # Add boundary conditions for aerosols if we have the data
-    if 'aerosol_boundary_data' in locals():
-        # Number concentration boundaries
-        nc_output['ls_forcing_left_aerosol'] = xr.DataArray(
-            aerosol_boundary_data['left'].astype(np.float32), 
-            dims=['time', 'z', 'y', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration - west boundary'})
-        
-        nc_output['ls_forcing_right_aerosol'] = xr.DataArray(
-            aerosol_boundary_data['right'].astype(np.float32), 
-            dims=['time', 'z', 'y', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration - east boundary'})
-        
-        nc_output['ls_forcing_south_aerosol'] = xr.DataArray(
-            aerosol_boundary_data['south'].astype(np.float32), 
-            dims=['time', 'z', 'x', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration - south boundary'})
-        
-        nc_output['ls_forcing_north_aerosol'] = xr.DataArray(
-            aerosol_boundary_data['north'].astype(np.float32), 
-            dims=['time', 'z', 'x', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration - north boundary'})
-        
-        nc_output['ls_forcing_top_aerosol'] = xr.DataArray(
-            aerosol_boundary_data['top'].astype(np.float32), 
-            dims=['time', 'y', 'x', 'Dmid'],
-            attrs={'units': '#/m3', 'lod': 1, 'source': 'WRF-Chem', 'long_name': 'aerosol number concentration - top boundary'})
-        
-        # Mass fraction boundaries (Mode A - soluble)
+    # Boundary aerosol variables - these also have 17 bins
+    nc_output['ls_forcing_left_aerosol'] = xr.DataArray(
+        aerosol_boundary_data['left'].astype(np.float32), 
+        dims=['time', 'z', 'y', 'Dmid'],
+        attrs={'units': '#/m3', 'long_name': 'aerosol number concentration - west boundary'})
+    
+    nc_output['ls_forcing_right_aerosol'] = xr.DataArray(
+        aerosol_boundary_data['right'].astype(np.float32), 
+        dims=['time', 'z', 'y', 'Dmid'],
+        attrs={'units': '#/m3', 'long_name': 'aerosol number concentration - east boundary'})
+    
+    nc_output['ls_forcing_south_aerosol'] = xr.DataArray(
+        aerosol_boundary_data['south'].astype(np.float32), 
+        dims=['time', 'z', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'long_name': 'aerosol number concentration - south boundary'})
+    
+    nc_output['ls_forcing_north_aerosol'] = xr.DataArray(
+        aerosol_boundary_data['north'].astype(np.float32), 
+        dims=['time', 'z', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'long_name': 'aerosol number concentration - north boundary'})
+    
+    nc_output['ls_forcing_top_aerosol'] = xr.DataArray(
+        aerosol_boundary_data['top'].astype(np.float32), 
+        dims=['time', 'y', 'x', 'Dmid'],
+        attrs={'units': '#/m3', 'long_name': 'aerosol number concentration - top boundary'})
+    
+    # Mass fraction boundaries
+    if 'left_mass_a' in aerosol_boundary_data and np.any(aerosol_boundary_data['left_mass_a']):
         nc_output['ls_forcing_left_mass_fracs_a'] = xr.DataArray(
             aerosol_boundary_data['left_mass_a'].astype(np.float32), 
             dims=['time', 'z', 'y', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fraction (Mode A) - west boundary'})
+            attrs={'units': '', 'long_name': 'soluble mass fractions - west boundary'})
         
         nc_output['ls_forcing_right_mass_fracs_a'] = xr.DataArray(
             aerosol_boundary_data['right_mass_a'].astype(np.float32), 
             dims=['time', 'z', 'y', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fraction (Mode A) - east boundary'})
+            attrs={'units': '', 'long_name': 'soluble mass fractions - east boundary'})
         
         nc_output['ls_forcing_south_mass_fracs_a'] = xr.DataArray(
             aerosol_boundary_data['south_mass_a'].astype(np.float32), 
             dims=['time', 'z', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fraction (Mode A) - south boundary'})
+            attrs={'units': '', 'long_name': 'soluble mass fractions - south boundary'})
         
         nc_output['ls_forcing_north_mass_fracs_a'] = xr.DataArray(
             aerosol_boundary_data['north_mass_a'].astype(np.float32), 
             dims=['time', 'z', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fraction (Mode A) - north boundary'})
+            attrs={'units': '', 'long_name': 'soluble mass fractions - north boundary'})
         
         nc_output['ls_forcing_top_mass_fracs_a'] = xr.DataArray(
             aerosol_boundary_data['top_mass_a'].astype(np.float32), 
             dims=['time', 'y', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'soluble mass fraction (Mode A) - top boundary'})
-        
-        # Mass fraction boundaries (Mode B - insoluble)
+            attrs={'units': '', 'long_name': 'soluble mass fractions - top boundary'})
+    
+    # Insoluble mass fractions
+    if 'left_mass_b' in aerosol_boundary_data and np.any(aerosol_boundary_data['left_mass_b']):
         nc_output['ls_forcing_left_mass_fracs_b'] = xr.DataArray(
             aerosol_boundary_data['left_mass_b'].astype(np.float32), 
             dims=['time', 'z', 'y', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fraction (Mode B) - west boundary'})
+            attrs={'units': '', 'long_name': 'insoluble mass fractions - west boundary'})
         
         nc_output['ls_forcing_right_mass_fracs_b'] = xr.DataArray(
             aerosol_boundary_data['right_mass_b'].astype(np.float32), 
             dims=['time', 'z', 'y', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fraction (Mode B) - east boundary'})
+            attrs={'units': '', 'long_name': 'insoluble mass fractions - east boundary'})
         
         nc_output['ls_forcing_south_mass_fracs_b'] = xr.DataArray(
             aerosol_boundary_data['south_mass_b'].astype(np.float32), 
             dims=['time', 'z', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fraction (Mode B) - south boundary'})
+            attrs={'units': '', 'long_name': 'insoluble mass fractions - south boundary'})
         
         nc_output['ls_forcing_north_mass_fracs_b'] = xr.DataArray(
             aerosol_boundary_data['north_mass_b'].astype(np.float32), 
             dims=['time', 'z', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fraction (Mode B) - north boundary'})
+            attrs={'units': '', 'long_name': 'insoluble mass fractions - north boundary'})
         
         nc_output['ls_forcing_top_mass_fracs_b'] = xr.DataArray(
             aerosol_boundary_data['top_mass_b'].astype(np.float32), 
             dims=['time', 'y', 'x', 'composition_index'],
-            attrs={'units': '', 'source': 'WRF-Chem', 'long_name': 'insoluble mass fraction (Mode B) - top boundary'})
-        
-        print("  All aerosol boundary variables added to output")
-    else:
-        print("  No aerosol boundary data available")
+            attrs={'units': '', 'long_name': 'insoluble mass fractions - top boundary'})
     
-    print("="*60)
+    print("  Aerosol variables added to dataset")
 
-#-------------------------------------------------------------------------------
-# Add radiation data to output
-#-------------------------------------------------------------------------------
+# Radiation output
 if len(rad_times_sec) > 0 and len(rad_values_proc[0]) > 0:
-    print("Adding radiation data to output file...")
+    nc_output['time_rad'] = xr.DataArray(np.array(rad_times_sec, dtype=np.float32), dims=['time_rad'], 
+        attrs={'units': 'seconds', 'long_name': 'time for radiation data'})
     
-    nc_output['time_rad'] = xr.DataArray(rad_times_sec, dims=['time_rad'], 
-        attrs={'units': 'seconds', 'long_name': 'time since simulation start for radiation'})
+    nc_output['rad_sw_in'] = xr.DataArray(np.array(rad_values_proc[0], dtype=np.float32), dims=['time_rad'],
+        attrs={'units': 'W/m2', 'long_name': 'incoming shortwave radiation', 'lod': np.int32(1)})
     
-    nc_output['rad_sw_in'] = xr.DataArray(rad_values_proc[0], dims=['time_rad'],
-        attrs={'units': 'W/m2', 'lod': 1, 'long_name': 'shortwave radiation incoming'})
-    nc_output['rad_lw_in'] = xr.DataArray(rad_values_proc[1], dims=['time_rad'],
-        attrs={'units': 'W/m2', 'lod': 1, 'long_name': 'longwave radiation incoming'})
-    nc_output['rad_sw_in_dif'] = xr.DataArray(rad_values_proc[2], dims=['time_rad'],
-        attrs={'units': 'W/m2', 'lod': 1, 'long_name': 'shortwave radiation incoming diffuse'})
-    print("Radiation data added successfully")
-else:
-    print("No radiation data to add to output file")
+    nc_output['rad_lw_in'] = xr.DataArray(np.array(rad_values_proc[1], dtype=np.float32), dims=['time_rad'],
+        attrs={'units': 'W/m2', 'long_name': 'incoming longwave radiation', 'lod': np.int32(1)})
+    
+    nc_output['rad_sw_in_dif'] = xr.DataArray(np.array(rad_values_proc[2], dtype=np.float32), dims=['time_rad'],
+        attrs={'units': 'W/m2', 'long_name': 'incoming diffuse shortwave radiation', 'lod': np.int32(1)})
 
-# Write all variables
-for var in nc_output.data_vars:
-    if var == "composition_name":
-        encoding = {var: {'dtype': 'S1', 'zlib': True, '_FillValue': None}}
-    else:
-        encoding = {var: {'dtype': 'float32', '_FillValue': -9999.0, 'zlib': True}}
-    
-    nc_output[var].to_netcdf(nc_output_name, encoding=encoding, mode='a')
+# After the composition summary, add this
+print(f"\n  TRACE METAL CONTRIBUTION TO TOTAL MASS:")
+print(f"  {'Species':<8} {'Mass Fraction (%)':<20}")
+print(f"  {'-'*8} {'-'*20}")
+for i, spec in enumerate(listspec):
+    if is_trace_metal(spec):
+        mean_frac = np.mean(mass_fracs_a_init[:, i]) * 100  # Percentage
+        print(f"    {spec:<8} {mean_frac:>18.4f}%")
 
-print('Add to your *_p3d file: ' + '\n soil_temperature = ' +
-      str([value for value in init_tsoil.mean(axis=(1, 2))]) +
-      '\n soil_moisture = ' + str([value for value in init_msoil.mean(axis=(1, 2))]) +
-      '\n deep_soil_temperature = ' + str(deep_tsoil) + '\n')
+# ===== WRITE EVERYTHING ONCE AT THE END =====
+print("Writing all variables to NetCDF file...")
+nc_output.to_netcdf(nc_output_name)
+print(f"File saved as: {nc_output_name}")
+
+# Final output
+print("\n" + "="*60)
+print('Add to your *_p3d file:')
+print(f' soil_temperature = {[float(v) for v in init_tsoil.mean(axis=(1, 2))]}')
+print(f' soil_moisture = {[float(v) for v in init_msoil.mean(axis=(1, 2))]}')
+print(f' deep_soil_temperature = {float(deep_tsoil)}')
+print("="*60)
 
 with open('cfg_files/' + case_name + '.cfg', "a") as cfg:
-    cfg.write('Add to your *_p3d file: ' + '\n soil_temperature = ' +
-              str([value for value in init_tsoil.mean(axis=(1, 2))]) +
-              '\n soil_moisture = ' + str([value for value in init_msoil.mean(axis=(1, 2))]) +
-              '\n deep_soil_temperature = ' + str(deep_tsoil) + '\n')
+    cfg.write(f'Add to your *_p3d file:\n soil_temperature = {[float(v) for v in init_tsoil.mean(axis=(1, 2))]}\n')
+    cfg.write(f' soil_moisture = {[float(v) for v in init_msoil.mean(axis=(1, 2))]}\n')
+    cfg.write(f' deep_soil_temperature = {float(deep_tsoil)}\n')
 
-print("="*60)
+# ===== CONDITIONAL NETCDF MODIFICATION FOR AEROSOL VARIABLES =====
+if aerosol_wrfchem:
+    print("="*60)
+    print("POST-PROCESSING: Reformatting aerosol variables in NetCDF file")
+    print("="*60)
+    
+    nc_output.close()
+    
+    # Now open and modify the file
+    import netCDF4 as nc4
+    
+    temp_output = nc_output_name + '_temp.nc'
+    os.rename(nc_output_name, temp_output)
+    
+    with nc4.Dataset(temp_output, 'r') as src:
+        with nc4.Dataset(nc_output_name, 'w', format='NETCDF4') as dst:
+            # Copy dimensions, excluding string1
+            for dim_name, dim in src.dimensions.items():
+                if dim_name != 'string1':
+                    dst.createDimension(dim_name, len(dim) if not dim.isunlimited() else None)
+            
+            # Copy global attributes
+            for attr_name in src.ncattrs():
+                dst.setncattr(attr_name, src.getncattr(attr_name))
+            
+            # Copy all variables except composition_name (handle separately)
+            for var_name, var in src.variables.items():
+                if var_name != 'composition_name':
+                    # Filter out string1 from dimensions if present
+                    dims = [d for d in var.dimensions if d != 'string1']
+                    
+                    # Get _FillValue if it exists
+                    fill_value = None
+                    if '_FillValue' in var.ncattrs():
+                        fill_value = var.getncattr('_FillValue')
+                    
+                    new_var = dst.createVariable(var_name, var.datatype, dims, fill_value=fill_value)
+                    
+                    # Copy all attributes except _FillValue
+                    for attr_name in var.ncattrs():
+                        if attr_name != '_FillValue':
+                            new_var.setncattr(attr_name, var.getncattr(attr_name))
+                    
+                    # Copy data - handle variables that had string1 dimension
+                    if 'string1' in var.dimensions:
+                        data = var[:]
+                        if data.shape[-1] == 1:
+                            data = data[..., 0]
+                        new_var[:] = data
+                    else:
+                        new_var[:] = var[:]
+            
+            # Handle composition_name specially
+            var = src.variables['composition_name']
+            
+            fill_value = None
+            if '_FillValue' in var.ncattrs():
+                fill_value = var.getncattr('_FillValue')
+            
+            # Create without string1 dimension
+            new_dims = ('composition_index', 'max_string_length')
+            new_var = dst.createVariable('composition_name', var.datatype, new_dims, fill_value=fill_value)
+            
+            for attr_name in var.ncattrs():
+                if attr_name != '_FillValue':
+                    new_var.setncattr(attr_name, var.getncattr(attr_name))
+            
+            # Reshape data: from (n_species, max_string_length, 1) to (n_species, max_string_length)
+            data = var[:]
+            if data.ndim == 3 and data.shape[-1] == 1:
+                data = data[:, :, 0]
+            new_var[:] = data
+    
+    # Remove the temporary file
+    os.remove(temp_output)
+    print(f"File saved as: {nc_output_name}")
+    print("="*60)
+else:
+    print("\n" + "="*60)
+    print("Skipping NetCDF post-processing (aerosol_wrfchem = False)")
+    print("="*60)
+    nc_output.close()
 
-nc_output.close()
-
-# Now open and modify the file
-import netCDF4 as nc4
-
-temp_output = nc_output_name + '_temp.nc'
-os.rename(nc_output_name, temp_output)
-
-with nc4.Dataset(temp_output, 'r') as src:
-    with nc4.Dataset(nc_output_name, 'w', format='NETCDF4') as dst:
-        # Copy dimensions, excluding string1
-        for dim_name, dim in src.dimensions.items():
-            if dim_name != 'string1':
-                dst.createDimension(dim_name, len(dim) if not dim.isunlimited() else None)
-        
-        # Copy global attributes
-        for attr_name in src.ncattrs():
-            dst.setncattr(attr_name, src.getncattr(attr_name))
-        
-        # Copy all variables except composition_name (handle separately)
-        for var_name, var in src.variables.items():
-            if var_name != 'composition_name':
-                # Filter out string1 from dimensions if present
-                dims = [d for d in var.dimensions if d != 'string1']
-                
-                # Get _FillValue if it exists
-                fill_value = None
-                if '_FillValue' in var.ncattrs():
-                    fill_value = var.getncattr('_FillValue')
-                
-                new_var = dst.createVariable(var_name, var.datatype, dims, fill_value=fill_value)
-                
-                # Copy all attributes except _FillValue
-                for attr_name in var.ncattrs():
-                    if attr_name != '_FillValue':
-                        new_var.setncattr(attr_name, var.getncattr(attr_name))
-                
-                # Copy data - handle variables that had string1 dimension
-                if 'string1' in var.dimensions:
-                    data = var[:]
-                    if data.shape[-1] == 1:
-                        data = data[..., 0]
-                    new_var[:] = data
-                else:
-                    new_var[:] = var[:]
-        
-        # Handle composition_name specially
-        var = src.variables['composition_name']
-        
-        fill_value = None
-        if '_FillValue' in var.ncattrs():
-            fill_value = var.getncattr('_FillValue')
-        
-        # Create without string1 dimension
-        new_dims = ('composition_index', 'max_string_length')
-        new_var = dst.createVariable('composition_name', var.datatype, new_dims, fill_value=fill_value)
-        
-        for attr_name in var.ncattrs():
-            if attr_name != '_FillValue':
-                new_var.setncattr(attr_name, var.getncattr(attr_name))
-        
-        # Reshape data: from (n_species, max_string_length, 1) to (n_species, max_string_length)
-        data = var[:]
-        if data.ndim == 3 and data.shape[-1] == 1:
-            data = data[:, :, 0]
-        new_var[:] = data
-
-# Remove the temporary file
-os.remove(temp_output)
-print(f"File saved as: {nc_output_name}")
-print("="*60)
-
+# ===== FINAL OUTPUT (always runs) =====
 end = datetime.now()
-print('PALM dynamic input file is ready. Script duration: {}'.format(end - start))
-print('Start time: ' + str(all_ts[0]))
-print('End time: ' + str(all_ts[-1]))
-print('Time step: ' + str(times_sec[1] - times_sec[0]) + ' seconds')
+print("="*60)
+print(f"PALM dynamic input file is ready!")
+print(f"Script duration: {end - start}")
+print(f"Start time: {all_ts[0]}")
+print(f"End time: {all_ts[-1]}")
+print(f"Time step: {times_sec[1] - times_sec[0]} seconds")
+print(f"Output file: {nc_output_name}")
+print("="*60)

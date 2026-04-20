@@ -49,5 +49,3 @@ def interp_array_1d(data, out_x) :
     data_res = np.interp(xvals, x, data)
 
     return (data_res)
-
-

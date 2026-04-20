@@ -1,140 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-###------------------------------------------------------------------------###
-# WRF4PALM
-# Functions to calculate geostrophic wind profiles
-# Based on: http://www.meteo.mcgill.ca/~huardda/amelie/geowind.py
-# @author: Dongqi Lin (dongqi.lin@canterbury.ac.nz)
-###------------------------------------------------------------------------###
+"""
+WRF4PALM - Vectorized geostrophic wind calculations
+"""
 import numpy as np
 
 def coriolis(lat):  
-    #Compute the Coriolis parameter for the given latitude:``f = 2*omega*sin(lat)``, where omega is the angular velocity of the Earth.
-    
-    #Parameterslat : array  Latitude [degrees].
-    import numpy as np
-    omega   = 7.2921159e-05  # angular velocity of the Earth [rad/s]
-    return (2*omega*np.sin(lat/360.0*2*np.pi)) 
+    """Compute the Coriolis parameter - vectorized"""
+    omega = 7.2921159e-05  # angular velocity of the Earth [rad/s]
+    return (2 * omega * np.sin(np.radians(lat)))
 
 def rho(T, p):
-    
-
-    
-    #Calculates air density (rho)
-    
-    
+    """Calculate air density - vectorized"""
     Rd = 287.0
+    return p / (Rd * T)
 
-#    Tv   = T * (1+0.61*qv) # Virtual temperature
-
-    rho = p / (Rd * T) # Air density [kg m^-3]
-
-    return(rho)
+def calc_geostrophic_wind_plevels(array_2d_press, array_2d_temp, array_1d_lat, array_1d_lon, dy, dx):
+    """
+    Calculate Geostrophic wind profile - FULLY VECTORIZED
+    No loops over i,j - uses numpy vectorization
+    """
+    # Vectorized Coriolis
+    f_lat = coriolis(array_1d_lat)
+    fx = np.nanmean(f_lat) * np.mean(dx)
+    fy = np.nanmean(f_lat) * np.mean(dy)
     
-def __midpoints_1d(a):
-    #Return `a` linearly interpolated at the mid-points.
-    return((a[:-1] + a[1:])/2.0)
-    
-def midpoints(a,  axis=None):
-    #Return `a` linearly interpolated at the mid-points.
-    
-    #Parameters
-    #----------
-    #a : array-like 
-      #Input array.
-    #axis : int or None
-      #Axis along which the interpolation takes place. None stands for all axes. 
-    
-    #Returns
-    #-------
-    #out : ndarray 
-      #Input array interpolated at the midpoints along the given axis. 
-      
-    #Examples
-    #--------
-    #>>> a = [1,2,3,4]
-    #>>> midpoints(a)
-    #array([1.5, 2.5, 3.5])
-
-    import numpy as np
-    x = np.asarray(a)
-    if axis is not None:
-        return(np.apply_along_axis(__midpoints_1d,  axis, x))
-    else:
-        for i in range(x.ndim):
-            x = midpoints(x,  i)
-        return(x)
-    
-def calc_geostrophic_wind_plevels(array_2d_press, array_2d_temp, array_1d_lat, array_1d_lon,dy, dx) :
-    
-
-
-    #Calculate Geostrophic wind profile (1 point value representing input 2d array area).
-    #Based on Practical_Meteorology-v1.02b-WholeBookColor pag.302
-    
-    #Parameters
-    #----------
-    #array_2d_press : read numpy array [Pa]
-    #array_2d_temp : read numpy array [k]
-    #array_1d_lat : read numpy array [deg]
-    #array_1d_lon : read numpy array [deg]
-
-    #Returns
-    #-------
-    #array : return interplated and extrapolated value
-  
-    
-    # Set up some constants based on our projection, including the Coriolis parameter and
-    # grid spacing, converting lon/lat spacing to Cartesian
-    
-    fx = np.nanmean(coriolis(array_1d_lat))*np.mean(dx)
-    fy = np.nanmean(coriolis(array_1d_lat))*np.mean(dy)
-    
-    
+    # Vectorized density calculation
     rho_tmp = np.nanmean(rho(array_2d_temp, array_2d_press))
-       
     
-    gradx = np.zeros_like(array_2d_press)
-    grady = np.zeros_like(array_2d_press)
+    # Vectorized pressure gradients (no loops!)
+    gradx = np.diff(array_2d_press, axis=1)  # Gradient along longitude
+    grady = np.diff(array_2d_press, axis=0)  # Gradient along latitude
     
-    for i in range(0,len(array_1d_lon)-1):
-        gradx[:,i] = array_2d_press[:,i+1]-array_2d_press[:,i] 
+    # Vectorized midpoint interpolation
+    gradx_mid = (gradx[:, :-1] + gradx[:, 1:]) / 2.0 if gradx.shape[1] > 1 else gradx
+    grady_mid = (grady[:-1, :] + grady[1:, :]) / 2.0 if grady.shape[0] > 1 else grady
     
-    for j in range(0,len(array_1d_lat)-1):
-        grady[j,:] = array_2d_press[j+1,:]-array_2d_press[j,:] 
- 
-    gradx = midpoints(gradx,  axis=0)
-    grady = midpoints(grady,  axis=1)
+    # Vectorized wind calculations
+    ug_tmp = np.nanmean((-1 / (rho_tmp * fy)) * grady_mid)
+    vg_tmp = np.nanmean((1 / (rho_tmp * fx)) * gradx_mid)
     
-    ug_tmp = np.nanmean((-1/(rho_tmp*fy))*grady)
-    vg_tmp = np.nanmean((1/(rho_tmp*fx))*gradx)
-    
-    
-    geo_wind = np.array([ug_tmp, vg_tmp])
-    
+    return np.array([ug_tmp, vg_tmp], dtype=np.float32)
 
-    return(geo_wind)
-
-
-
-def calc_geostrophic_wind_zlevels(gph, latitude, dy, dx) :
-    
- #Use geopotential height to calculte geostrophic wind
-    
-    
-    # Set up some constants based on our projection, including the Coriolis parameter and
-    # grid spacing, converting lon/lat spacing to Cartesian
-    
+def calc_geostrophic_wind_zlevels(gph, latitude, dy, dx):
+    """
+    Use geopotential height to calculate geostrophic wind - VECTORIZED
+    """
+    # Vectorized Coriolis
     f = np.nanmean(coriolis(latitude))
     
-    grady = gph[1:, :]- gph[:-1,:]
-    gradx = gph[:,:-1] - gph[:, 1:]
+    # Vectorized gradients (no loops!)
+    grady = np.diff(gph, axis=0)  # Gradient along latitude
+    gradx = -np.diff(gph, axis=1)  # Gradient along longitude (negative sign)
     
+    # Vectorized wind calculations
+    ug = -np.nanmean(grady / dy * 9.8 / f)
+    vg = np.nanmean(gradx / dx * 9.8 / f)
     
-    ug = -np.nanmean(grady/dy * 9.8/f)
-    vg = np.nanmean(gradx/dx * 9.8/f)
-    
-
-    return(ug, vg)
-
-##
+    return (ug.astype(np.float32), vg.astype(np.float32))
