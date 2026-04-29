@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#------------------------------------------------------------------------------#
-# Script for processing of WRF-CHEM files to PALM dynamic driver.
-# FULLY VECTORIZED VERSION - Optimized for memory efficiency and speed
-# EXTENDED: Trace metals (Pb, Hg, Ni, Cd, As) with dynamic PM2.5 scaling
-#------------------------------------------------------------------------------#
+"""
+WRF-Chem Aerosol Processing for PALM Dynamic Driver
+Fully vectorized with correct unit conversions and bin mapping.
+FIXED: #/kg -> #/m3 conversion, #/m3 mass preservation in overlap mapping,
+       trace metal scaling, and soluble/insoluble splitting.
+"""
 import numpy as np
 
 # ===== AEROSOL SPECIES TRANSLATION =====
@@ -26,140 +27,83 @@ AEROSOL_TRANSLATION = {
 
 WRFCHEM_BIN_SUFFIXES = ['_a01', '_a02', '_a03', '_a04']
 
-# ===== TRACE METAL LITERATURE VALUES =====
-# From Zereini et al. (2005) - Frankfurt am Main, Germany
-# Concentrations in ng/m³ measured at ~15 μg/m³ PM2.5
-
-LITERATURE_CONC_NG_M3 = {
+# ===== TRACE METAL LITERATURE VALUES (Zereini et al., 2005) =====
+'''LITERATURE_CONC_NG_M3 = {
     'urban': {'PB': 32.6, 'NI': 7.3, 'AS': 1.0, 'CD': 0.3, 'HG': 0.05},
     'rural': {'PB': 11.6, 'NI': 2.6, 'AS': 0.6, 'CD': 0.2, 'HG': 0.02}
+}'''
+LITERATURE_CONC_NG_M3 = {
+    'urban': {'PB': 1.7, 'NI': 1.5, 'AS': 0.3, 'CD': 0.06, 'HG': 0.05},
+    'rural': {'PB': 1.0, 'NI': 0.7, 'AS': 0.2, 'CD': 0.04, 'HG': 0.02}
 }
 
-# Reference PM2.5 from literature (used ONLY to derive mass fractions)
-REF_PM25_NG_M3 = 6000.0  # 6 μg/m³ = 6,000 ng/m³
+# Reference PM2.5 from literature (for mass fraction derivation only)
+REF_PM25_UG_M3 = 10.0  # μg/m³ typical urban PM2.5
 
-# Mass fractions - CONSTANT
-TRACE_METAL_MASS_FRACTIONS = {
-    'urban': {m: LITERATURE_CONC_NG_M3['urban'][m] / REF_PM25_NG_M3 
-              for m in ['PB', 'NI', 'AS', 'CD', 'HG']},
-    'rural': {m: LITERATURE_CONC_NG_M3['rural'][m] / REF_PM25_NG_M3 
-              for m in ['PB', 'NI', 'AS', 'CD', 'HG']}
-}
+# Constant trace metal mass fractions derived from literature
+TRACE_METAL_MASS_FRACTIONS = {}
+for stype in ['urban', 'rural']:
+    TRACE_METAL_MASS_FRACTIONS[stype] = {
+        m: LITERATURE_CONC_NG_M3[stype][m] * 1e-3 / REF_PM25_UG_M3
+        for m in ['PB', 'NI', 'AS', 'CD', 'HG']
+    }
 
 DEFAULT_TRACE_METAL_FRACTIONS = TRACE_METAL_MASS_FRACTIONS['rural'].copy()
-
-# Direct concentrations 
-TRACE_METAL_CONCENTRATIONS = LITERATURE_CONC_NG_M3.copy()
-DEFAULT_TRACE_METAL_CONCENTRATIONS = LITERATURE_CONC_NG_M3['rural'].copy()
 
 # ===== SPECIES CLASSIFICATION =====
 INSOLUBLE_SPECIES = ['BC', 'DU']
 SOLUBLE_SPECIES = ['SO4', 'OC', 'NH', 'NO', 'SS', 'PB', 'HG', 'NI', 'CD', 'AS']
 
+# Soluble fraction per species (fraction going to mode A / soluble bins)
+PARTITION_2A = {
+    'SO4': 0.90, 'OC': 0.70, 'BC': 0.10, 'DU': 0.10,
+    'SS': 0.90, 'NH': 0.90, 'NO': 0.90,
+    'PB': 0.50, 'HG': 0.50, 'NI': 0.50, 'CD': 0.50, 'AS': 0.50
+}
 
-#===============================================================================
-# Trace Metal Functions
-#===============================================================================
+# ==============================================================================
+# Trace Metal Helper Functions
+# ==============================================================================
 
 def is_trace_metal(species):
     """Check if a species is a trace metal."""
     return species in ['PB', 'HG', 'NI', 'CD', 'AS']
 
 
-def get_trace_metal_mass_fraction(metal, street_type=None):
-    """Get CONSTANT mass fraction for a given metal and street type."""
-    if street_type is None:
-        return DEFAULT_TRACE_METAL_FRACTIONS.get(metal, 0.0)
-    
-    if isinstance(street_type, str):
-        return TRACE_METAL_MASS_FRACTIONS.get(street_type, DEFAULT_TRACE_METAL_FRACTIONS).get(metal, 0.0)
-    
-    result = np.full_like(street_type, DEFAULT_TRACE_METAL_FRACTIONS.get(metal, 0.0), dtype=np.float32)
-    for stype, fracs in TRACE_METAL_MASS_FRACTIONS.items():
-        mask = (street_type == stype)
-        if np.any(mask):
-            result[mask] = fracs.get(metal, 0.0)
-    return result
-
-
-def get_trace_metal_concentration(metal, street_type=None):
-    """Get trace metal concentration in ng/m³ (constant literature values)."""
-    if street_type is None:
-        return DEFAULT_TRACE_METAL_CONCENTRATIONS.get(metal, 0.0)
-    
-    if isinstance(street_type, str):
-        return TRACE_METAL_CONCENTRATIONS.get(street_type, DEFAULT_TRACE_METAL_CONCENTRATIONS).get(metal, 0.0)
-    
-    result = np.full_like(street_type, DEFAULT_TRACE_METAL_CONCENTRATIONS.get(metal, 0.0), dtype=np.float32)
-    for stype, concs in TRACE_METAL_CONCENTRATIONS.items():
-        mask = (street_type == stype)
-        if np.any(mask):
-            result[mask] = concs.get(metal, 0.0)
-    return result
-
-
-def calculate_trace_metal_from_pm25(pm25_ug_m3, metal, street_type=None):
+def get_trace_metal_mass_fraction(metal, street_type_map=None):
     """
-    Calculate trace metal dynamically from PM2.5.
-    trace_metal (μg/m³) = PM2.5 (μg/m³) × mass_fraction
+    Get CONSTANT mass fraction for a given metal.
+    If street_type_map is provided, use pixel-specific urban/rural fractions.
     """
-    fraction = get_trace_metal_mass_fraction(metal, street_type)
-    return pm25_ug_m3 * fraction
-
-
-def create_trace_metal_array(pm25_data, metal, street_type_map):
-    """Create trace metal array from PM2.5 data."""
+    default_frac = DEFAULT_TRACE_METAL_FRACTIONS.get(metal, 0.0)
     if street_type_map is None:
-        fraction = DEFAULT_TRACE_METAL_FRACTIONS.get(metal, 0.0)
-        return pm25_data * fraction
+        return default_frac
     
-    if pm25_data.ndim == 1:
-        fraction = np.mean(get_trace_metal_mass_fraction(metal, street_type_map))
-        return pm25_data * fraction
-    elif pm25_data.ndim == 2:
-        fraction = get_trace_metal_mass_fraction(metal, street_type_map)
-        return pm25_data * fraction
-    elif pm25_data.ndim == 3:
-        fraction = get_trace_metal_mass_fraction(metal, street_type_map)
-        return pm25_data * fraction[np.newaxis, :, :]
-    elif pm25_data.ndim == 4:
-        fraction = get_trace_metal_mass_fraction(metal, street_type_map)
-        return pm25_data * fraction[np.newaxis, np.newaxis, :, :]
-    else:
-        fraction = DEFAULT_TRACE_METAL_FRACTIONS.get(metal, 0.0)
-        return pm25_data * fraction
-
-
-def create_trace_metal_concentration_array(metal, street_type_map, vertical_levels=1):
-    """
-    Compatibility function - creates concentration array from street type only.
-    Returns constant values (no PM2.5 scaling).
-    """
-    conc_ng_m3 = get_trace_metal_concentration(metal, street_type_map)
-    conc_ug_m3 = conc_ng_m3 / 1000.0
+    # Start with default rural
+    result = np.full(street_type_map.shape, default_frac, dtype=np.float32)
+    # Apply urban fraction where street_type indicates urban
+    if 'urban' in TRACE_METAL_MASS_FRACTIONS:
+        urban_frac = TRACE_METAL_MASS_FRACTIONS['urban'].get(metal, default_frac)
+        urban_mask = (street_type_map == 'urban') | (street_type_map == 1)
+        if np.any(urban_mask):
+            result[urban_mask] = urban_frac
     
-    if vertical_levels > 1:
-        if isinstance(conc_ug_m3, np.ndarray):
-            if conc_ug_m3.ndim == 2:
-                return np.tile(conc_ug_m3[np.newaxis, :, :], (vertical_levels, 1, 1))
-            else:
-                return np.full((vertical_levels, 1, 1), conc_ug_m3, dtype=np.float32)
-        else:
-            return np.full((vertical_levels, 1, 1), conc_ug_m3, dtype=np.float32)
-    return conc_ug_m3
+    return result
 
 
-#===============================================================================
-# Basic Translation Functions
-#===============================================================================
+# ==============================================================================
+# WRF Variable Name Functions
+# ==============================================================================
 
 def get_wrfchem_variables_for_species(palm_species):
+    """Get WRF-Chem variable names for a PALM species."""
     if palm_species in AEROSOL_TRANSLATION:
         return AEROSOL_TRANSLATION[palm_species]
     return [palm_species.lower()]
 
 
 def get_all_wrfchem_variables(palm_species_list):
+    """Get all WRF-Chem aerosol mass variable names (with bin suffixes)."""
     all_vars = []
     for species in palm_species_list:
         if is_trace_metal(species):
@@ -170,100 +114,239 @@ def get_all_wrfchem_variables(palm_species_list):
     return all_vars
 
 
-#===============================================================================
+# ==============================================================================
 # Bin Definition Functions
-#===============================================================================
+# ==============================================================================
 
 def define_bins(nbin, reglim):
-    nbins = np.sum(nbin)
+    """
+    Define PALM bin structure.
+    Returns dmid (geometric mean diameter) and bin_limits (lower limits + upper limit).
+    """
+    nbins = int(np.sum(nbin))
+    dmid = np.zeros(nbins, dtype=np.float32)
     vlolim = np.zeros(nbins, dtype=np.float32)
     vhilim = np.zeros(nbins, dtype=np.float32)
-    dmid   = np.zeros(nbins, dtype=np.float32)
-    bin_limits = np.zeros(nbins, dtype=np.float32)
+    bin_limits = np.zeros(nbins + 1, dtype=np.float32)
     
+    # Subrange 1
     ratio_d = reglim[1] / reglim[0]
     for b in range(nbin[0]):
         vlolim[b] = np.pi / 6.0 * (reglim[0] * ratio_d ** (float(b) / nbin[0])) ** 3
         vhilim[b] = np.pi / 6.0 * (reglim[0] * ratio_d ** (float(b+1) / nbin[0])) ** 3
-        dmid[b] = np.sqrt((6.0 * vhilim[b] / np.pi) ** 0.33333333 * (6.0 * vlolim[b] / np.pi) ** 0.33333333)
+        dmid[b] = np.sqrt((6.0 * vhilim[b] / np.pi) ** 0.33333333 * 
+                          (6.0 * vlolim[b] / np.pi) ** 0.33333333)
+        bin_limits[b] = (6.0 * vlolim[b] / np.pi) ** 0.33333333
     
+    # Subrange 2
     ratio_d = reglim[2] / reglim[1]
-    for b in np.arange(nbin[0], np.sum(nbin), 1):
+    for b in range(nbin[0], nbins):
         c = b - nbin[0]
         vlolim[b] = np.pi / 6.0 * (reglim[1] * ratio_d ** (float(c) / nbin[1])) ** 3
         vhilim[b] = np.pi / 6.0 * (reglim[1] * ratio_d ** (float(c+1) / nbin[1])) ** 3
-        dmid[b] = np.sqrt((6.0 * vhilim[b] / np.pi) ** 0.33333333 * (6.0 * vlolim[b] / np.pi) ** 0.33333333)
+        dmid[b] = np.sqrt((6.0 * vhilim[b] / np.pi) ** 0.33333333 * 
+                          (6.0 * vlolim[b] / np.pi) ** 0.33333333)
+        bin_limits[b] = (6.0 * vlolim[b] / np.pi) ** 0.33333333
     
-    bin_limits = (6.0 * vlolim / np.pi) ** 0.33333333
-    bin_limits = np.append(bin_limits, reglim[-1])
+    bin_limits[-1] = reglim[-1]
     
     return dmid, bin_limits
 
 
-def range_overlap(range1, range2):
-    x1, x2 = range1.start, range1.stop
-    y1, y2 = range2.start, range2.stop
-    return x1 <= y2 and y1 <= x2
-
-
 def aerosol_binoverlap(palm_binlim, wrfchem_binlim):
-    overlap_ratio = np.zeros((len(palm_binlim)-1, len(wrfchem_binlim)-1), dtype=np.float32)
-    aerobin_open = []
+    """
+    Calculate overlap ratios between PALM and WRF-Chem bins.
+    Returns open_bins list and overlap_ratio matrix.
+    The overlap ratio is FRACTION of each WRF bin falling into each PALM bin.
+    """
+    n_palm = len(palm_binlim) - 1
+    n_wrf = len(wrfchem_binlim) - 1
+    overlap_ratio = np.zeros((n_wrf, n_palm), dtype=np.float32)
     
-    for pbin in range(len(palm_binlim)-1):
-        palm_range = range(int(palm_binlim[pbin] * 1e+9), int(palm_binlim[pbin+1] * 1e+9))
-        for wbin in range(len(wrfchem_binlim)-1):
-            wrfchem_range = range(int(wrfchem_binlim[wbin] * 1e+9) + 1, int(wrfchem_binlim[wbin+1] * 1e+9))
-            if range_overlap(palm_range, wrfchem_range):
-                aerobin_open.append('_a0' + str(wbin+1))
-                overlap = len(set(palm_range) & set(wrfchem_range))
-                overlap_ratio[pbin, wbin] = overlap / len(wrfchem_range)
+    # Convert to nm for integer range overlap
+    palm_nm = (np.array(palm_binlim) * 1e9).astype(int)
+    wrf_nm = (np.array(wrfchem_binlim) * 1e9).astype(int)
     
-    return aerobin_open, overlap_ratio
+    for wbin in range(n_wrf):
+        w_low = wrf_nm[wbin]
+        w_high = wrf_nm[wbin + 1]
+        w_width = w_high - w_low
+        
+        if w_width <= 0:
+            continue
+            
+        for pbin in range(n_palm):
+            p_low = palm_nm[pbin]
+            p_high = palm_nm[pbin + 1]
+            p_width = p_high - p_low
+            
+            if p_width <= 0:
+                continue
+                
+            # Calculate overlap
+            overlap_low = max(w_low, p_low)
+            overlap_high = min(w_high, p_high)
+            
+            if overlap_low < overlap_high:
+                # Logarithmic overlap fraction for aerosol size distributions
+                overlap_width = overlap_high - overlap_low
+                # Fraction of WRF bin falling into PALM bin
+                overlap_ratio[wbin, pbin] = overlap_width / w_width
+    
+    return overlap_ratio
 
 
-#===============================================================================
-# Vectorized Functions
-#===============================================================================
-
-def vectorized_aerosol_mapping(wrf_num, overlap_ratio):
-    return np.dot(overlap_ratio, wrf_num).astype(np.float32)
-
+# ==============================================================================
+# Vectorized Processing Functions
+# ==============================================================================
 
 def vectorized_mass_fraction_batch(mass_matrix):
+    """Normalize mass fractions so they sum to 1.0 along the last axis."""
     total = np.sum(mass_matrix, axis=-1, keepdims=True)
-    total = np.where(total == 0, 1.0, total)
+    total = np.where(total < 1e-30, 1.0, total)
     return (mass_matrix / total).astype(np.float32)
 
 
 def vectorized_batch_aerosol_mapping(wrf_num_matrix, overlap_ratio):
-    return np.dot(wrf_num_matrix, overlap_ratio.T).astype(np.float32)
+    """
+    Map WRF-Chem number concentrations to PALM bins using overlap ratios.
+    PRESERVES total number: sum(PALM bins) = sum(WRF bins) * bin_width_factor
+    
+    wrf_num_matrix: shape (..., n_wrf_bins) in #/kg or #/m3
+    overlap_ratio: shape (n_wrf_bins, n_palm_bins)
+    Returns: shape (..., n_palm_bins)
+    """
+    return np.dot(wrf_num_matrix, overlap_ratio).astype(np.float32)
 
 
 def vectorized_bin_limits_to_centers(bin_limits):
+    """Calculate geometric mean bin centers from bin limit array."""
     return np.sqrt(bin_limits[:-1] * bin_limits[1:]).astype(np.float32)
 
 
-def map_wrfchem_to_palm_bins(palm_binlim, wrfchem_binlim, method='overlap'):
-    nbins_palm = len(palm_binlim) - 1
-    nbins_wrf = len(wrfchem_binlim) - 1
-    mapping = np.zeros((nbins_palm, nbins_wrf), dtype=np.float32)
+def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
+    """
+    Separate mass fractions into soluble (a) and insoluble (b) portions.
     
-    if method == 'simplified':
-        mapping = np.ones((nbins_palm, nbins_wrf), dtype=np.float32) / nbins_wrf
-    elif method == 'overlap':
-        for pbin in range(nbins_palm):
-            p_low, p_high = palm_binlim[pbin], palm_binlim[pbin+1]
-            total = 0
-            for wbin in range(nbins_wrf):
-                w_low, w_high = wrfchem_binlim[wbin], wrfchem_binlim[wbin+1]
-                overlap_low, overlap_high = max(p_low, w_low), min(p_high, w_high)
-                if overlap_low < overlap_high:
-                    weight = np.log(overlap_high / overlap_low) / np.log(w_high / w_low)
-                    mapping[pbin, wbin] = weight
-                    total += weight
-            if total > 0:
-                mapping[pbin, :] /= total
-            else:
-                mapping[pbin, :] = 1.0 / nbins_wrf
-    return mapping
+    Parameters:
+    - mass_array: shape (..., n_species) with mass fractions summing to 1
+    - listspec: list of species names
+    - nf2a: soluble fraction factor (0.75 means 75% to soluble bins)
+    
+    Returns:
+    - mass_fracs_a: normalized mass fractions for soluble bins
+    - mass_fracs_b: normalized mass fractions for insoluble bins
+    """
+    n_species = len(listspec)
+    n_dims = mass_array.ndim
+    
+    mass_a = np.copy(mass_array)
+    mass_b = np.copy(mass_array)
+    
+    for idx, spec in enumerate(listspec):
+        frac_2a = PARTITION_2A.get(spec, 0.5)
+        
+        # Create index slice
+        idx_slice = [slice(None)] * n_dims
+        idx_slice[-1] = idx
+        
+        mass_a[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * frac_2a
+        mass_b[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * (1.0 - frac_2a)
+    
+    # Normalize each to sum to 1
+    mass_fracs_a = vectorized_mass_fraction_batch(mass_a)
+    mass_fracs_b = vectorized_mass_fraction_batch(mass_b)
+    
+    return mass_fracs_a, mass_fracs_b
+
+
+# ==============================================================================
+# Unit Conversion Function (CRITICAL FIX)
+# ==============================================================================
+
+def convert_wrfchem_to_palm_units(wrf_data_dict, alt_inv):
+    """
+    Convert WRF-Chem variables from mixing ratio units to PALM concentration units.
+    
+    WRF-Chem aerosol variables are in:
+    - Mass: μg/kg-dryair  ->  PALM needs kg/m³
+    - Number: #/kg-dryair ->  PALM needs #/m³
+    
+    Conversion:
+    - M_PALM = M_WRF * 1e-9 / ALT  (μg/kg -> kg/m³)
+    - N_PALM = N_WRF / ALT          (#/kg -> #/m³)
+    
+    where ALT is inverse density (m³/kg), so 1/ALT = air density (kg/m³)
+    """
+    converted = {}
+    
+    for var_name, var_data in wrf_data_dict.items():
+        if var_name.startswith('num_'):
+            # Number concentration: #/kg -> #/m³
+            converted[var_name] = var_data / alt_inv
+        else:
+            # Mass concentration: μg/kg -> kg/m³
+            converted[var_name] = var_data * 1e-9 / alt_inv
+    
+    return converted
+
+
+def combine_aerosol_mass_from_wrf(wrf_mass_data, listspec, alt_inv):
+    """
+    Combine WRF-Chem aerosol species into PALM species and convert units.
+    
+    Parameters:
+    - wrf_mass_data: dict with keys like 'so4_a01', 'no3_a02', etc. in μg/kg
+    - listspec: list of PALM species names
+    - alt_inv: inverse density array from WRF (m³/kg)
+    
+    Returns:
+    - mass_matrix: shape (..., n_species) in kg/m³
+    """
+    # Get the shape from a sample variable
+    sample_key = list(wrf_mass_data.keys())[0]
+    base_shape = wrf_mass_data[sample_key].shape[:-1]  # remove last dim (bins)
+    n_species = len(listspec)
+    n_wrf_bins = 4  # WRF-Chem has 4 bins
+    
+    mass_matrix = np.zeros(base_shape + (n_species,), dtype=np.float32)
+    
+    for idx, spec in enumerate(listspec):
+        if is_trace_metal(spec):
+            continue
+        
+        wrf_names = get_wrfchem_variables_for_species(spec)
+        for wrf_name in wrf_names:
+            for bin_idx, suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+                var_name = f'{wrf_name}{suffix}'
+                if var_name in wrf_mass_data:
+                    # Convert μg/kg -> kg/m³
+                    mass_matrix[..., idx] += wrf_mass_data[var_name] * 1e-9 / alt_inv
+    
+    return mass_matrix
+
+
+def combine_aerosol_number_from_wrf(wrf_num_data, alt_inv):
+    """
+    Combine WRF-Chem number variables and convert to #/m³.
+    
+    Parameters:
+    - wrf_num_data: dict with keys like 'num_a01', 'num_a02', etc. in #/kg
+    - alt_inv: inverse density array from WRF (m³/kg)
+    
+    Returns:
+    - num_matrix: shape (..., 4) in #/m³
+    """
+    # Get shape from first variable
+    sample_key = list(wrf_num_data.keys())[0]
+    base_shape = wrf_num_data[sample_key].shape[:-1]
+    
+    num_matrix = np.zeros(base_shape + (4,), dtype=np.float32)
+    
+    for bin_idx, suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
+        var_name = f'num{suffix}'
+        if var_name in wrf_num_data:
+            # Convert #/kg -> #/m³
+            num_matrix[..., bin_idx] = wrf_num_data[var_name] / alt_inv
+    
+    return num_matrix

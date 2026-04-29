@@ -5,11 +5,11 @@ geostrophic = " ", ## calculate geostrophic wind using the variable pressure (op
 
 [domain]
 palm_proj = "EPSG:25832",    # projection of PALM
-centlat = 48.36587,  #Konigsplatz
-centlon = 10.89428, 
-nx        = 400,                                  # number of grid points along x-axis
-ny        = 400,                                  # number of grid points along y-axis
-nz        = 200,                                  # number of grid points along z-axis
+centlat = 48.376713,  #Konigsplatz
+centlon = 10.888324, 
+nx        = 100,                                  # number of grid points along x-axis
+ny        = 100,                                  # number of grid points along y-axis
+nz        = 50,                                  # number of grid points along z-axis
 dx        = 10.0,                                 # number of grid points along x-axis
 dy        = 10.0,                                 # number of grid points along y-axis
 dz        = 10.0,                                 # number of grid points along z-axis
@@ -18,11 +18,11 @@ z_origin  = 508.0,                                # elevated mean grid position 
 [stretch]
 dz_stretch_factor = 1.08,         # stretch factor for a vertically stretched grid
                                 # set this to 1.0 if no streching required
-dz_stretch_level = 800.0,      # Height level above which the grid is to be stretched vertically (in m)
+dz_stretch_level = 400.0,      # Height level above which the grid is to be stretched vertically (in m)
 dz_max = 50.0,                  # allowed maximum vertical grid spacing (in m)
 
 [wrf]
-wrf_path = "/home/vaithisa/WRF4PALM_v1.1.2/wrf_output/", 
+wrf_path = "/home/vaithisa/WRF4PALM_v1.1.2/wrf_output/", #"/home/vaithisa/WRF4PALM_v1.1.2/wrf_output/",  "/mnt/d/WRF-Chem/"
 wrf_output = "wrfout_d02_2024-08-*",   #"wrfout_d02_2025-02-*" "wrfout_d02_2024-08-*" "wrfout_d02_2022-04-*"
 
 interp_mode = "linear",  #"nearest" "linear"
@@ -46,7 +46,7 @@ dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
 msoil = 0.3, # dummy value in case soil moisture from WRF output is 0.0
 
 [chemistry] 
-species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "PM10","PM2_5_DRY", "no2_traffic","no_traffic", "PM10_traffic","PM2_5_DRY_traffic"]   #all_species
+species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "PM10","PM2_5_DRY", "no2_tra","no_tra", "PM10_tra","PM2_5_DRY_tra"]   #all_species
 # species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV"]   #salsa+simple
 # species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "no2_traffic","no_traffic"]   #salsa+simple_tra
 # species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no", "no2_traffic","no_traffic"]   #simple_traffic
@@ -63,8 +63,9 @@ radiation_smoothing_distance = 10000.0,  # Distance (in meters) around domain ce
 [aerosol]
 # Aerosol processing settings
 aerosol_wrfchem = True,                     # Enable aerosol processing
-listspec = ["SO4", "OC", "BC","DU", "SS", "NH", "NO"],  # Aerosol chemical components ["SO4", "OC", "BC", "SS", "NH", "NO", "DU"], 
+# listspec = ['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH'],  # Aerosol chemical components ["SO4", "OC", "BC", "SS", "NH", "NO", "DU"],
+listspec = ['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH' 'PB', 'HG', 'NI', 'CD', 'AS'],
 nbin = [3, 7],                              # Number of bins in each subrange [bins in subrange 1, bins in subrange 2]
 reglim = [3.9e-8, 1.56e-7, 1.0e-5],        #[3.9e-8, 5.0e-8, 2.5e-6],  # Bin limits (m) [d_min, d_split, d_max] in meters
 wrfchem_bin_limits = [3.9e-8, 1.56e-7, 6.25e-7, 2.5e-6, 1.0e-5],  # WRF-Chem bin limits
-nf2a = 1.0,                                 # Soluble/insoluble fraction factor
+nf2a = 0.75,                                 # (1.0) - Soluble/ (less than 1) insoluble fraction factor
