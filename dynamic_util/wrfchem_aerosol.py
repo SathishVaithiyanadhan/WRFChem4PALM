@@ -231,7 +231,9 @@ def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
     Parameters:
     - mass_array: shape (..., n_species) with mass fractions summing to 1
     - listspec: list of species names
-    - nf2a: soluble fraction factor (0.75 means 75% to soluble bins)
+    - nf2a: soluble fraction factor
+        if nf2a >= 1.0: ALL mass goes to soluble mode (mass_fracs_b = ZERO)
+        if nf2a < 1.0: Split between soluble (a) and insoluble (b) modes
     
     Returns:
     - mass_fracs_a: normalized mass fractions for soluble bins
@@ -240,20 +242,25 @@ def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
     n_species = len(listspec)
     n_dims = mass_array.ndim
     
+    # Handle nf2a >= 1.0 case - all mass to soluble mode
+    if nf2a >= 1.0:
+        mass_fracs_a = vectorized_mass_fraction_batch(mass_array)
+        mass_fracs_b = np.zeros_like(mass_fracs_a)
+        return mass_fracs_a, mass_fracs_b
+    
+    # For nf2a < 1.0, split between soluble and insoluble modes
     mass_a = np.copy(mass_array)
     mass_b = np.copy(mass_array)
     
     for idx, spec in enumerate(listspec):
         frac_2a = PARTITION_2A.get(spec, 0.5)
         
-        # Create index slice
         idx_slice = [slice(None)] * n_dims
         idx_slice[-1] = idx
         
         mass_a[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * frac_2a
         mass_b[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * (1.0 - frac_2a)
     
-    # Normalize each to sum to 1
     mass_fracs_a = vectorized_mass_fraction_batch(mass_a)
     mass_fracs_b = vectorized_mass_fraction_batch(mass_b)
     

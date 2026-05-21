@@ -20,7 +20,7 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
     n_levels = len(zcoord)
     
     # For small jobs, use vectorized single process (faster than pool)
-    if n_levels <= 10:
+    if n_levels < 10:
         print(f"    Using vectorized interpolation for {var} ({n_levels} levels)")
         
         # Process all levels in main process (no pickling)

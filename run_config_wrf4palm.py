@@ -53,6 +53,41 @@ warnings.filterwarnings("ignore", '.*pyproj.*')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
+def enforce_exact_sum_to_one(array, axis=-1):
+    """
+    Ensure array sums exactly to 1.0 along specified axis.
+    Uses float64 precision and adjusts the last element to achieve exact sum.
+    
+    Parameters:
+    - array: input numpy array
+    - axis: axis along which to sum (default -1, last axis)
+    
+    Returns:
+    - array with exact sum of 1.0 along specified axis
+    """
+    # Convert to float64 for high precision
+    arr_f64 = array.astype(np.float64)
+    
+    # Calculate sum along axis
+    total = np.sum(arr_f64, axis=axis, keepdims=False)
+    
+    # Build index for last element along target axis
+    # For a 2D array (z, species) with axis=-1:
+    # We want [: , -1] - all z-levels, last species
+    last_idx = [slice(None)] * arr_f64.ndim
+    last_idx[axis] = -1
+    
+    # Calculate correction (1 - total)
+    # total already has the summed dimension removed
+    correction = 1.0 - total
+    
+    # Add correction to last element
+    arr_f64[tuple(last_idx)] += correction
+    
+    # Convert back to float32
+    return arr_f64.astype(np.float32)
+
+
 def setup_traffic_variables(chem_species):
     """Check if traffic variables are requested"""
     traffic_mapping = {}
@@ -691,13 +726,17 @@ ds_palm_sn["V"] = multi_zinterp(max_pool, ds_sn_vstag, "V", z, ds_palm_sn)
 del zeros_we_v, zeros_sn_v
 gc.collect()
 
-# Traffic variables
+# ===== MODIFICATION 1: Traffic variables set to ZERO (not copied) =====
 if has_traffic_vars:
-    print("Setting up traffic variables in boundary conditions...")
+    print("Setting up traffic variables with ZERO initial/boundary conditions...")
     for base_species, traffic_species in traffic_mapping.items():
         if base_species in ds_palm_we.data_vars:
-            ds_palm_we[traffic_species] = ds_palm_we[base_species].copy()
-            ds_palm_sn[traffic_species] = ds_palm_sn[base_species].copy()
+            # Set to ZERO instead of copying from base species
+            zeros_we_tra = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+            zeros_sn_tra = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+            ds_palm_we[traffic_species] = xr.DataArray(zeros_we_tra, dims=['time', 'z', 'y', 'x'])
+            ds_palm_sn[traffic_species] = xr.DataArray(zeros_sn_tra, dims=['time', 'z', 'y', 'x'])
+            print(f"  ZEROED: {traffic_species}")
 
 # Handle NaN values
 print("Handling NaN values in boundary conditions...")
@@ -773,10 +812,12 @@ if "OCNV" in chem_species:
         if comp in chem_top:
             chem_top["OCNV"] += chem_top[comp]
 
+# ===== MODIFICATION 1 (continued): Traffic species top boundary set to ZERO =====
 if has_traffic_vars:
     for base_species, traffic_species in traffic_mapping.items():
-        if base_species in chem_top:
-            chem_top[traffic_species] = chem_top[base_species].copy()
+        # Set traffic species to ZERO (not copied from base)
+        chem_top[traffic_species] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+        print(f"  ZEROED top: {traffic_species}")
 
 for species in original_chem_species + aerosol_vars:
     if species in chem_top:
@@ -932,10 +973,12 @@ if "OCNV" in chem_species:
             ocnv_init += chem_init[comp].values
     chem_init["OCNV"] = xr.DataArray(ocnv_init, dims=['z'], coords={'z': z})
 
+# ===== MODIFICATION 1 (continued): Traffic species initial profiles set to ZERO =====
 if has_traffic_vars:
     for base_species, traffic_species in traffic_mapping.items():
-        if base_species in chem_init:
-            chem_init[traffic_species] = chem_init[base_species].copy()
+        # Set traffic species initial to ZERO (not copied from base)
+        chem_init[traffic_species] = xr.DataArray(np.zeros(len(z), dtype=np.float32), dims=['z'], coords={'z': z})
+        print(f"  ZEROED init: {traffic_species}")
 
 surface_pres = psfc_wrf[:, :, :].mean(dim=["south_north", "west_east"]).load().astype(np.float32)
 
@@ -1031,6 +1074,11 @@ if aerosol_wrfchem:
     mass_fracs_a_init, mass_fracs_b_init = create_separated_mass_fractions(
         mass_fracs_orig, listspec, nf2a
     )
+    
+    # ===== MODIFICATION 2: Enforce exact sum to 1 for initial mass fractions =====
+    #mass_fracs_a_init = enforce_exact_sum_to_one(mass_fracs_a_init, axis=-1)
+    #if nf2a < 1.0:
+    #    mass_fracs_b_init = enforce_exact_sum_to_one(mass_fracs_b_init, axis=-1)
     
     # Collect WRF number concentrations (#/kg -> #/m³)
     wrf_num_matrix = np.zeros((len(z), n_wrf_bins), dtype=np.float32)
@@ -1337,7 +1385,7 @@ if aerosol_wrfchem:
         flat_a, flat_b = create_separated_mass_fractions(flat_mass, listspec, nf2a)
         top_mass_a[ts, :, :, :] = flat_a.reshape(top_mass_norm[ts].shape)
         top_mass_b[ts, :, :, :] = flat_b.reshape(top_mass_norm[ts].shape)
-    
+
     # Store boundary data
     aerosol_boundary_data = {
         'left': left_aerosol, 'right': right_aerosol,
@@ -1604,7 +1652,7 @@ if aerosol_wrfchem and 'aerosol_boundary_data' in locals():
         {'units': '#/m3', 'long_name': 'aerosol number concentration - top boundary'}
     )
     
-    if 'left_mass_a' in aerosol_boundary_data and np.any(aerosol_boundary_data['left_mass_a']):
+    if 'left_mass_a' in aerosol_boundary_data:
         nc_output['ls_forcing_left_mass_fracs_a'] = (
             ['time', 'z', 'y', 'composition_index'],
             aerosol_boundary_data['left_mass_a'].astype(np.float32),
@@ -1631,7 +1679,7 @@ if aerosol_wrfchem and 'aerosol_boundary_data' in locals():
             {'units': '', 'long_name': 'soluble mass fractions - top boundary'}
         )
     
-    if 'left_mass_b' in aerosol_boundary_data and np.any(aerosol_boundary_data['left_mass_b']):
+    if 'left_mass_b' in aerosol_boundary_data:
         nc_output['ls_forcing_left_mass_fracs_b'] = (
             ['time', 'z', 'y', 'composition_index'],
             aerosol_boundary_data['left_mass_b'].astype(np.float32),
