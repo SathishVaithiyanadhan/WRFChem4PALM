@@ -96,10 +96,10 @@ def setup_traffic_variables(chem_species):
     for species in chem_species:
         if species.endswith('_tra'):
             base_species = species.replace('_tra', '')
-            if base_species in ['no', 'no2', 'PM10', 'PM2_5_DRY']:
-                traffic_mapping[base_species] = species
-                has_traffic = True
-                print(f"Traffic variable requested: {species}")
+            # Accept ANY base species for traffic variables
+            traffic_mapping[base_species] = species
+            has_traffic = True
+            print(f"Traffic variable requested: {species}")
     
     return has_traffic, traffic_mapping
 
@@ -725,6 +725,77 @@ ds_palm_sn["V"] = xr.DataArray(zeros_sn_v, dims=['time', 'z', 'yv', 'x'])
 ds_palm_sn["V"] = multi_zinterp(max_pool, ds_sn_vstag, "V", z, ds_palm_sn)
 del zeros_we_v, zeros_sn_v
 gc.collect()
+
+# ===== Aggregate composite species for side boundaries (from component species) =====
+if "RH" in chem_species:
+    print("Aggregating RH for side boundary conditions...")
+    rh_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    rh_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    for comp in RH_components:
+        if comp in ds_palm_we.data_vars:
+            rh_we += ds_palm_we[comp].data
+            rh_sn += ds_palm_sn[comp].data
+    ds_palm_we["RH"] = xr.DataArray(rh_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn["RH"] = xr.DataArray(rh_sn, dims=['time', 'z', 'y', 'x'])
+    print(f"  RH added to ds_palm_we/ds_palm_sn (from {len(RH_components)} components)")
+    del rh_we, rh_sn
+    gc.collect()
+
+if "RO2" in chem_species:
+    print("Aggregating RO2 for side boundary conditions...")
+    ro2_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    ro2_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    for comp in RO2_components:
+        if comp in ds_palm_we.data_vars:
+            ro2_we += ds_palm_we[comp].data
+            ro2_sn += ds_palm_sn[comp].data
+    ds_palm_we["RO2"] = xr.DataArray(ro2_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn["RO2"] = xr.DataArray(ro2_sn, dims=['time', 'z', 'y', 'x'])
+    print(f"  RO2 added to ds_palm_we/ds_palm_sn (from {len(RO2_components)} components)")
+    del ro2_we, ro2_sn
+    gc.collect()
+
+if "RCHO" in chem_species:
+    print("Aggregating RCHO for side boundary conditions...")
+    rcho_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    rcho_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    for comp in RCHO_components:
+        if comp in ds_palm_we.data_vars:
+            rcho_we += ds_palm_we[comp].data
+            rcho_sn += ds_palm_sn[comp].data
+    ds_palm_we["RCHO"] = xr.DataArray(rcho_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn["RCHO"] = xr.DataArray(rcho_sn, dims=['time', 'z', 'y', 'x'])
+    print(f"  RCHO added to ds_palm_we/ds_palm_sn (from {len(RCHO_components)} components)")
+    del rcho_we, rcho_sn
+    gc.collect()
+
+if "OCSV" in chem_species:
+    print("Aggregating OCSV for side boundary conditions...")
+    ocsv_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    ocsv_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    for comp in OCSV_components:
+        if comp in ds_palm_we.data_vars:
+            ocsv_we += ds_palm_we[comp].data
+            ocsv_sn += ds_palm_sn[comp].data
+    ds_palm_we["OCSV"] = xr.DataArray(ocsv_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn["OCSV"] = xr.DataArray(ocsv_sn, dims=['time', 'z', 'y', 'x'])
+    print(f"  OCSV added to ds_palm_we/ds_palm_sn (from {len(OCSV_components)} components)")
+    del ocsv_we, ocsv_sn
+    gc.collect()
+
+if "OCNV" in chem_species:
+    print("Aggregating OCNV for side boundary conditions...")
+    ocnv_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
+    ocnv_sn = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
+    for comp in OCNV_components:
+        if comp in ds_palm_we.data_vars:
+            ocnv_we += ds_palm_we[comp].data
+            ocnv_sn += ds_palm_sn[comp].data
+    ds_palm_we["OCNV"] = xr.DataArray(ocnv_we, dims=['time', 'z', 'y', 'x'])
+    ds_palm_sn["OCNV"] = xr.DataArray(ocnv_sn, dims=['time', 'z', 'y', 'x'])
+    print(f"  OCNV added to ds_palm_we/ds_palm_sn (from {len(OCNV_components)} components)")
+    del ocnv_we, ocnv_sn
+    gc.collect()
 
 # ===== MODIFICATION 1: Traffic variables set to ZERO (not copied) =====
 if has_traffic_vars:
@@ -1558,7 +1629,7 @@ for species in original_chem_species:
             attrs={'units': units, 'source': 'WRF-Chem', 'lod': np.int32(1)})
     
     if species in ds_palm_we.data_vars:
-        if species in ['PM10', 'PM2_5_DRY'] or species.replace('_traffic', '') in ['PM10', 'PM2_5_DRY']:
+        if species in ['PM10', 'PM2_5_DRY'] or species.replace('_tra', '') in ['PM10', 'PM2_5_DRY']:
             left_data = ds_palm_we[species][:, :, :, 0].data * MICROGRAM_TO_KG
             right_data = ds_palm_we[species][:, :, :, -1].data * MICROGRAM_TO_KG
             south_data = ds_palm_sn[species][:, :, 0, :].data * MICROGRAM_TO_KG
