@@ -28,17 +28,12 @@ AEROSOL_TRANSLATION = {
 WRFCHEM_BIN_SUFFIXES = ['_a01', '_a02', '_a03', '_a04']
 
 # ===== TRACE METAL LITERATURE VALUES (Zereini et al., 2005) =====
-'''LITERATURE_CONC_NG_M3 = {
-    'urban': {'PB': 32.6, 'NI': 7.3, 'AS': 1.0, 'CD': 0.3, 'HG': 0.05},
-    'rural': {'PB': 11.6, 'NI': 2.6, 'AS': 0.6, 'CD': 0.2, 'HG': 0.02}
-}'''
 LITERATURE_CONC_NG_M3 = {
     'urban': {'PB': 1.7, 'NI': 1.5, 'AS': 0.3, 'CD': 0.06, 'HG': 0.05},
-    'rural': {'PB': 1.0, 'NI': 0.7, 'AS': 0.2, 'CD': 0.04, 'HG': 0.02}
-}
+    'rural': {'PB': 1.0, 'NI': 0.7, 'AS': 0.2, 'CD': 0.04, 'HG': 0.02}}
 
 # Reference PM2.5 from literature (for mass fraction derivation only)
-REF_PM25_UG_M3 = 10.0  # μg/m³ typical urban PM2.5
+REF_PM25_UG_M3 = 10.0  # micrograms/m3 typical urban PM2.5
 
 # Constant trace metal mass fractions derived from literature
 TRACE_METAL_MASS_FRACTIONS = {}
@@ -228,39 +223,47 @@ def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
     """
     Separate mass fractions into soluble (a) and insoluble (b) portions.
     
+    Behavior depends on nf2a:
+    - nf2a >= 1.0: All aerosol is soluble. mass_fracs_a = original composition,
+                    mass_fracs_b = all zeros (no 2b bins in PALM).
+    - nf2a < 1.0:  Both soluble and insoluble modes exist. Mass is split using
+                    per-species PARTITION_2A solubility factors, then each is
+                    normalized to sum to 1.
+    
     Parameters:
     - mass_array: shape (..., n_species) with mass fractions summing to 1
     - listspec: list of species names
-    - nf2a: soluble fraction factor
-        if nf2a >= 1.0: ALL mass goes to soluble mode (mass_fracs_b = ZERO)
-        if nf2a < 1.0: Split between soluble (a) and insoluble (b) modes
+    - nf2a: soluble fraction factor (1.0 = all soluble, <1.0 = split into a/b)
     
     Returns:
     - mass_fracs_a: normalized mass fractions for soluble bins
     - mass_fracs_b: normalized mass fractions for insoluble bins
     """
+    if nf2a >= 1.0:
+        # All aerosol is soluble — use the original composition as-is for mass_fracs_a,
+        # and set mass_fracs_b to all zeros (no insoluble mode in PALM).
+        mass_fracs_a = vectorized_mass_fraction_batch(np.copy(mass_array))
+        mass_fracs_b = np.zeros_like(mass_array)
+        return mass_fracs_a, mass_fracs_b
+    
+    # nf2a < 1.0: Split mass based on per-species solubility (PARTITION_2A)
     n_species = len(listspec)
     n_dims = mass_array.ndim
     
-    # Handle nf2a >= 1.0 case - all mass to soluble mode
-    if nf2a >= 1.0:
-        mass_fracs_a = vectorized_mass_fraction_batch(mass_array)
-        mass_fracs_b = np.zeros_like(mass_fracs_a)
-        return mass_fracs_a, mass_fracs_b
-    
-    # For nf2a < 1.0, split between soluble and insoluble modes
     mass_a = np.copy(mass_array)
     mass_b = np.copy(mass_array)
     
     for idx, spec in enumerate(listspec):
         frac_2a = PARTITION_2A.get(spec, 0.5)
         
+        # Create index slice
         idx_slice = [slice(None)] * n_dims
         idx_slice[-1] = idx
         
         mass_a[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * frac_2a
         mass_b[tuple(idx_slice)] = mass_array[tuple(idx_slice)] * (1.0 - frac_2a)
     
+    # Normalize each to sum to 1
     mass_fracs_a = vectorized_mass_fraction_batch(mass_a)
     mass_fracs_b = vectorized_mass_fraction_batch(mass_b)
     

@@ -116,7 +116,7 @@ def extract_scalar_from_xarray(xr_values):
 def get_air_density(alt_data, varname="ALT", clip_min=0.3, clip_max=2.0):
     """
     Calculate air density from WRF ALT (inverse density) variable.
-    ALT is in m³/kg, so air density = 1/ALT in kg/m³.
+    ALT is in m3/kg, so air density = 1/ALT in kg/m3.
     Clips ALT to prevent unphysical densities.
     """
     alt_val = extract_scalar_from_xarray(alt_data)
@@ -124,9 +124,44 @@ def get_air_density(alt_data, varname="ALT", clip_min=0.3, clip_max=2.0):
     air_density = 1.0 / alt_clipped
     
     if alt_val != alt_clipped:
-        print(f"    Note: {varname} clipped from {alt_val:.4f} to {alt_clipped:.4f} m³/kg")
+        print(f"    Note: {varname} clipped from {alt_val:.4f} to {alt_clipped:.4f} m3/kg")
     
     return air_density
+
+
+def compute_q_sat(temp_k, pres_pa):
+    """
+    Compute saturation specific humidity from temperature and pressure.
+    
+    Parameters:
+    - temp_k: temperature in Kelvin
+    - pres_pa: pressure in Pascals
+    
+    Returns:
+    - q_sat: saturation specific humidity in kg/kg
+    """
+    # Magnus formula for saturation vapor pressure
+    e_sat = 611.0 * np.exp(17.27 * (temp_k - 273.15) / (temp_k - 35.85))
+    # Saturation specific humidity
+    q_sat = 0.622 * e_sat / (pres_pa - 0.378 * e_sat)
+    return q_sat
+
+
+def cap_qvapor_at_rh(qv, temp_k, pres_pa, rh_max=0.999):
+    """
+    Cap specific humidity so relative humidity does not exceed rh_max.
+    
+    Parameters:
+    - qv: specific humidity array (kg/kg)
+    - temp_k: temperature array (K)
+    - pres_pa: pressure array (Pa)
+    - rh_max: maximum relative humidity fraction (default 0.999 = 99.9%)
+    
+    Returns:
+    - qv_capped: capped specific humidity array
+    """
+    q_sat = compute_q_sat(temp_k, pres_pa)
+    return np.minimum(qv, rh_max * q_sat)
 
 
 #===============================================================================
@@ -306,6 +341,12 @@ if aerosol_wrfchem:
     print(f"Aerosol mass variables to process: {aerosol_mass_vars}")
     print(f"Aerosol number variables to process: {aerosol_num_vars}")
     print(f"Total aerosol variables: {len(aerosol_vars)}")
+    
+    # Automatically include PM2_5_DRY if trace metals are in the species list
+    if any(is_trace_metal(spec) for spec in listspec):
+        if 'PM2_5_DRY' not in all_chem_to_process:
+            all_chem_to_process.append('PM2_5_DRY')
+            print("  Added PM2_5_DRY for trace metal mass fraction estimation")
 
 print(f"Total species to process: {len(all_chem_to_process)}")
 
@@ -483,6 +524,9 @@ ds_drop["pt"] = ds_drop["T"] + 300
 ds_drop["pt"].attrs = ds_drop["T"].attrs
 ds_drop["gph"] = (ds_drop["PH"] + ds_drop["PHB"]) / 9.81
 ds_drop["gph"].attrs = ds_drop["PH"].attrs
+if "PRESSURE" not in ds_drop.data_vars:
+    ds_drop["PRESSURE"] = ds_drop["P"] + ds_drop["PB"]
+    ds_drop["PRESSURE"].attrs = ds_drop["P"].attrs
 
 #===============================================================================
 # PROCESSING HEADER
@@ -640,7 +684,7 @@ ds_we_vstag = ds_interp_v.isel(west_east=[0, -1])
 ds_sn_ustag = ds_interp_u.isel(south_north=[0, -1])
 ds_sn_vstag = ds_interp_v.isel(south_north=[0, -1])
 
-varbc_list = ["W", "QVAPOR", "pt", "Z"]
+varbc_list = ["W", "QVAPOR", "pt", "PRESSURE", "Z"]
 varbc_list.extend(all_chem_to_process)
 
 for var in list(ds_we.data_vars):
@@ -662,7 +706,7 @@ ds_palm_sn = ds_palm_sn.assign_coords({"x": x, "y": y[:2], "time": ds_interp.tim
                                        "z": z, "yv": yv[:2], "xu": xu, "zw": zw})
 
 # Process meteorological variables
-met_vars = ["QVAPOR", "pt"]
+met_vars = ["QVAPOR", "pt", "PRESSURE"]
 for varbc in met_vars:
     print(f"Processing {varbc} for boundaries...")
     zeros_we = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
@@ -676,6 +720,28 @@ for varbc in met_vars:
     
     del zeros_we, zeros_sn
     gc.collect()
+
+# ===== Cap relative humidity at 99.9% in boundary conditions =====
+# WRF numerical advection can produce supersaturated qv (>100% RH).
+# This cap removes those artifacts while preserving realistic moisture.
+print("Capping boundary QVAPOR at 99.9% RH...")
+Rd_gas = 287.0
+cp_gas = 1005.0
+p0_ref = 100000.0
+
+# Convert pt to T: T = pt * (p / p0)^(Rd/cp)
+# Then compute q_sat(T, p) and cap QVAPOR
+for bounds_data, bounds_name in [(ds_palm_we, "WE"), (ds_palm_sn, "SN")]:
+    if "PRESSURE" in bounds_data.data_vars and "pt" in bounds_data.data_vars:
+        pres_bc = bounds_data["PRESSURE"].values
+        pt_bc = bounds_data["pt"].values
+        temp_bc = pt_bc * (pres_bc / p0_ref) ** (Rd_gas / cp_gas)
+        bounds_data["QVAPOR"].values = cap_qvapor_at_rh(
+            bounds_data["QVAPOR"].values, temp_bc, pres_bc, rh_max=0.999
+        )
+        print(f"  Capped {bounds_name} QVAPOR")
+    else:
+        print(f"  WARNING: PRESSURE or pt not found for {bounds_name}, skipping RH cap")
 
 # Process chemistry species
 print(f"\nProcessing {len(all_chem_to_process)} chemistry species...")
@@ -852,6 +918,15 @@ for ts in tqdm(range(len(all_ts)), desc="Top boundary"):
         if species in ds_interp.data_vars:
             chem_top[species][ts, :, :] = ds_interp[species].isel(time=ts, bottom_top=-1).astype(np.float32)
 
+# Cap top boundary qv at 99.9% RH
+if "PRESSURE" in ds_interp.data_vars:
+    print("Capping top boundary QVAPOR at 99.9% RH...")
+    p_top_vals = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
+    for ts in range(len(all_ts)):
+        p_top_vals[ts, :, :] = ds_interp["PRESSURE"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    temp_top = pt_top * (p_top_vals / p0_ref) ** (Rd_gas / cp_gas)
+    qv_top = cap_qvapor_at_rh(qv_top, temp_top, p_top_vals, rh_max=0.999)
+
 # Aggregate species
 if "RH" in chem_species:
     chem_top["RH"] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
@@ -983,8 +1058,14 @@ w_init = ds_drop["W"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).
     {"bottom_top": zw}, method=interp_mode).astype(np.float32)
 qv_init = ds_drop["QVAPOR"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
     {"bottom_top": z}, method=interp_mode).astype(np.float32)
+p_init = ds_drop["PRESSURE"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
+    {"bottom_top": z}, method=interp_mode).astype(np.float32)
 pt_init = ds_drop["pt"].sel(time=dt_start).mean(dim=["south_north", "west_east"]).interp(
     {"bottom_top": z}, method=interp_mode).astype(np.float32)
+
+# Cap initial qv profile at 99.9% RH
+temp_init = pt_init * (p_init / p0_ref) ** (Rd_gas / cp_gas)
+qv_init = cap_qvapor_at_rh(qv_init, temp_init, p_init, rh_max=0.999)
 
 u10_mean = u10_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
 v10_mean = v10_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
@@ -1107,10 +1188,10 @@ if aerosol_wrfchem:
     
     air_density_init = get_air_density(alt_init_data, "ALT_init")
     
-    print(f"    ALT (inverse density) from WRF: {extract_scalar_from_xarray(alt_init_data):.4f} m³/kg")
-    print(f"    Air density for unit conversion: {air_density_init:.3f} kg/m³")
+    print(f"    ALT (inverse density) from WRF: {extract_scalar_from_xarray(alt_init_data):.4f} m3/kg")
+    print(f"    Air density for unit conversion: {air_density_init:.3f} kg/m3")
     
-    # Initialize mass matrix (kg/m³ for each species)
+    # Initialize mass matrix (kg/m3 for each species)
     mass_matrix = np.zeros((len(z), n_species), dtype=np.float32)
     
     # Process explicit WRF-Chem species
@@ -1122,15 +1203,30 @@ if aerosol_wrfchem:
             for bin_suffix in WRFCHEM_BIN_SUFFIXES:
                 var_name = f'{wrf_name}{bin_suffix}'
                 if var_name in chem_init:
-                    # Convert μg/kg-dryair -> kg/m³
+                    # Convert ug/kg-dryair -> kg/m3
                     mass_matrix[:, idx] += chem_init[var_name].values * 1e-9 * air_density_init
     
     # Add trace metals
     trace_metal_added = False
     for idx, spec in enumerate(listspec):
         if is_trace_metal(spec):
+            pm25_available = False
+            pm25_profile = None
+            
+            # First, check if PM2_5_DRY was already processed via the species list
             if 'PM2_5_DRY' in chem_init:
-                pm25_kg_m3 = chem_init['PM2_5_DRY'].values * 1e-9 * air_density_init
+                pm25_profile = chem_init['PM2_5_DRY'].values
+                pm25_available = True
+            # Otherwise, try to read PM2_5_DRY directly from the WRF dataset
+            elif 'PM2_5_DRY' in ds_drop.data_vars:
+                pm25_profile = ds_drop['PM2_5_DRY'].sel(time=dt_start).mean(
+                    dim=["south_north", "west_east"]
+                ).interp({"bottom_top": z}, method=interp_mode).load().data.astype(np.float32)
+                pm25_available = True
+                print("    PM2_5_DRY read directly from WRF for trace metal estimation")
+            
+            if pm25_available:
+                pm25_kg_m3 = pm25_profile * 1e-9 * air_density_init
                 fraction = get_trace_metal_mass_fraction(spec, street_type_surface)
                 mass_matrix[:, idx] = pm25_kg_m3 * np.mean(fraction)
                 trace_metal_added = True
@@ -1151,14 +1247,14 @@ if aerosol_wrfchem:
     #if nf2a < 1.0:
     #    mass_fracs_b_init = enforce_exact_sum_to_one(mass_fracs_b_init, axis=-1)
     
-    # Collect WRF number concentrations (#/kg -> #/m³)
+    # Collect WRF number concentrations (#/kg -> #/m3)
     wrf_num_matrix = np.zeros((len(z), n_wrf_bins), dtype=np.float32)
     for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
         num_var = f'num{bin_suffix}'
         if num_var in chem_init:
             wrf_num_matrix[:, wbin] = chem_init[num_var].values * air_density_init
     
-    print(f"    WRF number conc. range: {wrf_num_matrix.min():.2e} - {wrf_num_matrix.max():.2e} #/m³")
+    print(f"    WRF number conc. range: {wrf_num_matrix.min():.2e} - {wrf_num_matrix.max():.2e} #/m3")
     
     # Map WRF 4 bins to PALM 10 bins
     aerosol_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_matrix, overlap_ratio)
@@ -1181,7 +1277,7 @@ if aerosol_wrfchem:
                                          dims=['z', 'Dmid'])
     
     print(f"\n    Aerosol concentration shape: {aerosol_concentration_init.shape}")
-    print(f"    Concentration range: {aerosol_concentration_init.min():.2e} - {aerosol_concentration_init.max():.2e} #/m³")
+    print(f"    Concentration range: {aerosol_concentration_init.min():.2e} - {aerosol_concentration_init.max():.2e} #/m3")
     
     print(f"\n    Bin concentrations (mean over first 5 z-levels):")
     for bin_idx in range(min(nbins_total, 17)):
@@ -1196,7 +1292,7 @@ if aerosol_wrfchem:
                 bin_label = "2b"
             else:
                 bin_label = "2a"
-            print(f"      Bin {bin_idx+1:2d} ({bin_label}, d={dmid_all[bin_idx]*1e9:.1f} nm): {bin_mean:.2e} #/m³")
+            print(f"      Bin {bin_idx+1:2d} ({bin_label}, d={dmid_all[bin_idx]*1e9:.1f} nm): {bin_mean:.2e} #/m3")
     
     print(f"\n    Composition summary (averaged over all z levels):")
     print(f"      {'Species':<8} {'mass_frac_a':<14} {'mass_frac_b':<14}")
