@@ -524,9 +524,10 @@ ds_drop["pt"] = ds_drop["T"] + 300
 ds_drop["pt"].attrs = ds_drop["T"].attrs
 ds_drop["gph"] = (ds_drop["PH"] + ds_drop["PHB"]) / 9.81
 ds_drop["gph"].attrs = ds_drop["PH"].attrs
-if "PRESSURE" not in ds_drop.data_vars:
-    ds_drop["PRESSURE"] = ds_drop["P"] + ds_drop["PB"]
-    ds_drop["PRESSURE"].attrs = ds_drop["P"].attrs
+# NOTE: Salem's open_wrf_dataset adds PRESSURE in hPa, but we need Pa.
+# Always override with P+PB to ensure correct units (Pa, not hPa).
+ds_drop["PRESSURE"] = ds_drop["P"] + ds_drop["PB"]
+ds_drop["PRESSURE"].attrs = ds_drop["P"].attrs
 
 #===============================================================================
 # PROCESSING HEADER
