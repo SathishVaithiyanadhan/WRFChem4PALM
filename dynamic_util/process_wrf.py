@@ -19,9 +19,9 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
     is_w = (var == "W")
     n_levels = len(zcoord)
     
-    # For small jobs, use vectorized single process (faster than pool)
+    # For small jobs, use sequential single process (faster than batch for small data)
     if n_levels <= 10:
-        print(f"    Using vectorized interpolation for {var} ({n_levels} levels)")
+        print(f"    Sequential interpolation for {var} ({n_levels} levels)")
         
         # Process all levels in main process (no pickling)
         for lvl in zcoord:
@@ -38,13 +38,11 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
         
         return ds_out[var]
     
-    # For larger jobs, extract data first, then parallelize
-    print(f"    Using parallel interpolation for {var} ({n_levels} levels)")
+    # For larger jobs: batch all levels in one vectorized salem call
+    print(f"    Vectorized (batch) interpolation for {var} ({n_levels} levels)")
     
-    # FIRST: Extract all data at once (avoids pickling dataset)
-    # Get the data for all levels at once using vectorized operation
+    # Extract all levels at once using vectorized salem operation
     try:
-        # Try vectorized extraction
         all_data = ds_in.salem.wrf_zlevel(var, levels=zcoord, use_multiprocessing=False)
         all_data = all_data.astype(np.float32)
         
@@ -59,8 +57,8 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
         return ds_out[var]
         
     except:
-        # Fallback: process sequentially (no pickling)
-        print(f"    Falling back to sequential interpolation for {var}")
+        # Fallback: process level by level
+        print(f"    Level-by-level interpolation for {var}")
         for lvl in tqdm(zcoord, desc=f"    {var}", leave=False):
             data = ds_in.salem.wrf_zlevel(var, levels=lvl, use_multiprocessing=False)
             data = data.astype(np.float32)

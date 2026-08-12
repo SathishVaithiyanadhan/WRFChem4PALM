@@ -299,6 +299,32 @@ except:
 
 print(f"Radiation from WRF: {radiation_from_wrf}")
 
+# Output path configuration
+try:
+    raw_path = ast.literal_eval(config.get("output", "dynamic_driver_path"))
+    if isinstance(raw_path, (list, tuple)):
+        dynamic_driver_path = raw_path[0]
+    else:
+        dynamic_driver_path = raw_path
+    print(f"Dynamic driver output path: {dynamic_driver_path}")
+except:
+    dynamic_driver_path = None
+    print("Dynamic driver output path: default (dynamic_files/)")
+
+# Write LOD=2 (3D) init_atmosphere fields
+try:
+    write_init_3d = ast.literal_eval(config.get("output", "write_init_3d"))[0]
+except:
+    write_init_3d = True
+print(f"Write 3D init_atmosphere fields (LOD=2): {write_init_3d}")
+
+# Enable mass balancing on U,V,W boundaries
+try:
+    enable_mass_balance = ast.literal_eval(config.get("output", "enable_mass_balance"))[0]
+except:
+    enable_mass_balance = True
+print(f"Mass balancing (U,V,W): {enable_mass_balance}")
+
 # Component species for aggregation
 RH_components = ["isopr", "apin", "bpin", "limon", "bcary", "myrc", 
                 "benzene", "tol", "xylenes", "bigalk", "bigene", "c2h4", "c3h6"]
@@ -350,17 +376,66 @@ if aerosol_wrfchem:
 
 print(f"Total species to process: {len(all_chem_to_process)}")
 
-# Domain parameters
-palm_proj_code = ast.literal_eval(config.get("domain", "palm_proj"))[0]
-centlat = ast.literal_eval(config.get("domain", "centlat"))[0]
-centlon = ast.literal_eval(config.get("domain", "centlon"))[0]
-dx = ast.literal_eval(config.get("domain", "dx"))[0]
-dy = ast.literal_eval(config.get("domain", "dy"))[0]
-dz = ast.literal_eval(config.get("domain", "dz"))[0]
-nx = ast.literal_eval(config.get("domain", "nx"))[0]
-ny = ast.literal_eval(config.get("domain", "ny"))[0]
-nz = ast.literal_eval(config.get("domain", "nz"))[0]
-z_origin = ast.literal_eval(config.get("domain", "z_origin"))[0]
+# Read PALM static driver for domain parameters (auto-detection)
+# Config values override static driver values when both are specified
+static_driver_path = None
+try:
+    raw_sd = ast.literal_eval(config.get("domain", "static_driver_path"))
+    if isinstance(raw_sd, (list, tuple)):
+        static_driver_path = raw_sd[0]
+    else:
+        static_driver_path = raw_sd
+    print(f"Static driver: {static_driver_path}")
+except:
+    print("Static driver: not specified, using manual config")
+
+if static_driver_path and os.path.exists(static_driver_path):
+    print("  Reading domain parameters from static driver...")
+    ds_static = xr.open_dataset(static_driver_path)
+    # Grid dimensions
+    sd_nx = ds_static.dims['x']
+    sd_ny = ds_static.dims['y']
+    sd_dx = float(ds_static.x[1] - ds_static.x[0])
+    sd_dy = float(ds_static.y[1] - ds_static.y[0])
+    # Terrain-derived z_origin (origin_z = base terrain, zt = relative height above it)
+    sd_zt_mean = float(ds_static['zt'].values.mean())
+    sd_z_origin = float(ds_static.origin_z) + sd_zt_mean
+    # Projection from static driver's CRS attribute
+    if 'crs' in ds_static.variables and 'epsg_code' in ds_static['crs'].attrs:
+        sd_palm_proj = ds_static['crs'].attrs['epsg_code']
+    else:
+        utm_zone = int((float(ds_static.origin_lon) + 180) / 6) + 1
+        sd_palm_proj = f"EPSG:326{utm_zone:02d}"
+    # Compute domain center from origin (SW corner) + half domain
+    palm_proj_sd = Proj(sd_palm_proj)
+    wgs_proj_sd = Proj(proj='latlong', datum='WGS84', ellips='sphere')
+    trans_sd = Transformer.from_proj(palm_proj_sd, wgs_proj_sd, always_xy=True)
+    centx_sd = float(ds_static.origin_x) + sd_nx * sd_dx / 2.0
+    centy_sd = float(ds_static.origin_y) + sd_ny * sd_dy / 2.0
+    sd_centlon, sd_centlat = trans_sd.transform(centx_sd, centy_sd)
+    print(f"    nx={sd_nx}, ny={sd_ny}, dx={sd_dx:.0f}, dy={sd_dy:.0f}")
+    print(f"    z_origin={sd_z_origin:.1f}m (origin_z={ds_static.origin_z:.1f} + mean(zt)={sd_zt_mean:.1f})")
+    print(f"    centlon={sd_centlon:.4f}, centlat={sd_centlat:.4f}, proj={sd_palm_proj}")
+    ds_static.close()
+else:
+    sd_nx = sd_ny = sd_dx = sd_dy = sd_z_origin = sd_centlat = sd_centlon = None
+    sd_palm_proj = None
+
+# Domain parameters (config values override static driver)
+palm_proj_code = ast.literal_eval(config.get("domain", "palm_proj"))[0] if config.has_option("domain", "palm_proj") and config.get("domain", "palm_proj").strip() else (sd_palm_proj or "")
+centlat = ast.literal_eval(config.get("domain", "centlat"))[0] if config.has_option("domain", "centlat") and config.get("domain", "centlat").strip() else sd_centlat
+centlon = ast.literal_eval(config.get("domain", "centlon"))[0] if config.has_option("domain", "centlon") and config.get("domain", "centlon").strip() else sd_centlon
+dx = ast.literal_eval(config.get("domain", "dx"))[0] if config.has_option("domain", "dx") and config.get("domain", "dx").strip() else sd_dx
+dy = ast.literal_eval(config.get("domain", "dy"))[0] if config.has_option("domain", "dy") and config.get("domain", "dy").strip() else sd_dy
+dz = ast.literal_eval(config.get("domain", "dz"))[0]  # dz cannot come from static driver
+nx = ast.literal_eval(config.get("domain", "nx"))[0] if config.has_option("domain", "nx") and config.get("domain", "nx").strip() else sd_nx
+ny = ast.literal_eval(config.get("domain", "ny"))[0] if config.has_option("domain", "ny") and config.get("domain", "ny").strip() else sd_ny
+nz = ast.literal_eval(config.get("domain", "nz"))[0]  # nz cannot come from static driver
+z_origin = ast.literal_eval(config.get("domain", "z_origin"))[0] if config.has_option("domain", "z_origin") and config.get("domain", "z_origin").strip() else sd_z_origin
+
+print(f"Domain: nx={nx}, ny={ny}, nz={nz}, dx={dx}, dy={dy}, dz={dz}")
+print(f"Center: lat={centlat}, lon={centlon}")
+print(f"z_origin={z_origin:.1f}m, projection={palm_proj_code}")
 
 # Create coordinate arrays (float32)
 y = np.arange(dy/2, dy*ny + dy/2, dy, dtype=np.float32)
@@ -372,6 +447,11 @@ yv = y + np.gradient(y)/2
 yv = yv[:-1].astype(np.float32)
 zw = z + np.gradient(z)/2
 zw = zw[:-1].astype(np.float32)
+
+# Physical constants (used for RH capping throughout)
+Rd_gas = 287.0   # dry air gas constant (J/kg/K)
+cp_gas = 1005.0  # specific heat of dry air (J/kg/K)
+p0_ref = 100000.0  # reference pressure (Pa)
 
 # Stretch grid
 dz_stretch_factor = ast.literal_eval(config.get("stretch", "dz_stretch_factor"))[0]
@@ -602,6 +682,129 @@ pt2_wrf = t2_wrf * ((1000) / (psfc_wrf * 0.01)) ** 0.286
 surface_var_dict = {"U": u10_wrf, "V": v10_wrf, "pt": pt2_wrf, "QVAPOR": qv2_wrf, "W": None}
 
 #===============================================================================
+# Full 3D Vertical Interpolation for init_atmosphere (LOD=2)
+# Interpolates FULL horizontal domain to PALM z-levels at t=0 only.
+# Used for init_atmosphere_* with dims (z, y, x) / (z, y, xu) / (z, yv, x) / (zw, y, x)
+# NOTE: skipped for SALSA/aerosol runs - PALM requires LOD=1 (1D) met init there.
+#===============================================================================
+use_3d_init = write_init_3d and not aerosol_wrfchem
+if use_3d_init:
+    print("\n" + "="*60)
+    print("Full 3D vertical interpolation for init_atmosphere (t=0, LOD=2)")
+    print("  Using terrain-following interpolation (zero NaN)")
+    print(f"  Domain: {nx}x{ny}x{nz} = {nx*ny*nz} grid points per variable")
+    print("="*60)
+    
+    from time import time as _time
+    init_3d_vars = {}
+    
+    # Pre-compute WRF height field once for terrain-following interpolation
+    # Salem already provides Z on scalar (mid-)levels, with shape (nz_wrf, ny, nx)
+    z_wrf_mid = ds_interp['Z'].isel(time=0).values.astype(np.float64)  # (nz_wrf, ny, nx)
+    # Surface reference: lowest WRF scalar level height (~terrain + ~25m AGL)
+    z_surf_wrf = z_wrf_mid[0]  # (ny, nx)
+    
+    def _interp_terrain(ds_horiz, var_name, target_z):
+        """Terrain-following vertical interpolation.
+        
+        For each column, shifts PALM z-levels by local terrain offset so every
+        column starts above the lowest WRF data level. Zero NaN guaranteed.
+        Uses np.interp per column - fast and robust.
+        """
+        t0 = _time()
+        ds_slice = ds_horiz.isel(time=0) if 'time' in ds_horiz.dims else ds_horiz
+        var_3d = ds_slice[var_name].values.astype(np.float64)
+        ny_in, nx_in = var_3d.shape[1:]
+        nz_wrf_in = var_3d.shape[0]
+        
+        # Slice height fields to match this variable's horizontal grid
+        z_mid_use = z_wrf_mid[:nz_wrf_in, :ny_in, :nx_in]
+        z_surf_use = z_surf_wrf[:ny_in, :nx_in]
+        
+        nz_out = len(target_z)
+        result = np.zeros((nz_out, ny_in, nx_in), dtype=np.float32)
+        
+        for j in range(ny_in):
+            for i in range(nx_in):
+                z_local = target_z.astype(np.float64) + (z_surf_use[j, i] - z_origin)
+                result[:, j, i] = np.interp(
+                    z_local, z_mid_use[:, j, i], var_3d[:, j, i],
+                    left=var_3d[0, j, i], right=var_3d[-1, j, i]
+                ).astype(np.float32)
+        
+        elapsed = _time() - t0
+        print(f"  {var_name}: {result.shape} [{elapsed:.1f}s]")
+        return result
+    
+    # Meteorology
+    for var in ['pt', 'QVAPOR', 'PRESSURE']:
+        init_3d_vars[var] = _interp_terrain(ds_interp, var, z)
+    
+    # U on staggered xu grid
+    init_3d_vars['U'] = _interp_terrain(ds_interp_u, 'U', z)
+    
+    # V on staggered yv grid
+    init_3d_vars['V'] = _interp_terrain(ds_interp_v, 'V', z)
+    
+    # W: interpolate to z levels first, then average to zw
+    _w_on_z = _interp_terrain(ds_interp, 'W', z)
+    init_3d_vars['W'] = ((_w_on_z[:-1] + _w_on_z[1:]) / 2.0).astype(np.float32)
+    print(f"  W (zw): {init_3d_vars['W'].shape}")
+    
+    # Chemistry is NOT interpolated to 3D here: PALM only accepts chemistry
+    # init_atmosphere_* as LOD=1 (1D profiles), so chemistry init is handled
+    # separately from chem_init below. Skipping saves ~1 min of computation.
+    print(f"  Chemistry: 1D profiles only (LOD=1, PALM requirement; {len(all_chem_to_process)} species)")
+    
+    # Cap init 3D qv at 99.9% RH
+    if 'QVAPOR' in init_3d_vars and 'PRESSURE' in init_3d_vars and 'pt' in init_3d_vars:
+        temp_3d = init_3d_vars['pt'] * (init_3d_vars['PRESSURE'] / p0_ref) ** (Rd_gas / cp_gas)
+        init_3d_vars['QVAPOR'] = cap_qvapor_at_rh(init_3d_vars['QVAPOR'], temp_3d, init_3d_vars['PRESSURE'], rh_max=0.999)
+        print("  Capped init 3D QVAPOR at 99.9% RH")
+    
+    # Fix NaN at surface in 3D init fields
+    # (WRF terrain below PALM terrain causes NaN at bottom levels)
+    print("  Fixing surface NaN in 3D init fields using 2m/10m surface values...")
+    u10_surf_3d = u10_wrf.isel(time=0).values   # (ny, nx) on xu grid
+    v10_surf_3d = v10_wrf.isel(time=0).values   # (ny, nx) on yv grid
+    pt2_surf_3d = pt2_wrf.isel(time=0).values   # (ny, nx) on mass grid
+    qv2_surf_3d = qv2_wrf.isel(time=0).values   # (ny, nx) on mass grid
+    
+    def _fill_nan_3d(arr, z_arr, surf_2d, method='scalar'):
+        """Fill NaN at bottom of 3D array column-by-column using surface value."""
+        if not np.any(np.isnan(arr)):
+            return arr
+        res = arr.copy()
+        nz, ny, nx = arr.shape
+        for j in range(ny):
+            for i in range(nx):
+                col = res[:, j, i]
+                if np.isnan(col[0]):
+                    if method == 'uv':
+                        res[:, j, i] = surface_nan_uv(col, z_arr, surf_2d[j, i])
+                    elif method == 'w':
+                        res[:, j, i] = surface_nan_w(col)
+                    else:
+                        res[:, j, i] = surface_nan_s(col, z_arr, surf_2d[j, i])
+        return res
+    
+    init_3d_vars['pt'] = _fill_nan_3d(init_3d_vars['pt'], z, pt2_surf_3d, 'scalar')
+    init_3d_vars['QVAPOR'] = _fill_nan_3d(init_3d_vars['QVAPOR'], z, qv2_surf_3d, 'scalar')
+    init_3d_vars['U'] = _fill_nan_3d(init_3d_vars['U'], z, u10_surf_3d, 'uv')
+    init_3d_vars['V'] = _fill_nan_3d(init_3d_vars['V'], z, v10_surf_3d, 'uv')
+    init_3d_vars['W'] = _fill_nan_3d(init_3d_vars['W'], zw, None, 'w')
+
+    print("  Surface NaN fix complete")
+    
+    print("="*60)
+else:
+    init_3d_vars = {}
+    if aerosol_wrfchem:
+        print("init_atmosphere (LOD=1) for (SALSA/aerosol run) — using 1D profiles (LOD=1)")
+    else:
+        print("3D init_atmosphere (LOD=2) disabled — using 1D profiles (LOD=1)")
+
+#===============================================================================
 # Soil Moisture and Temperature
 #===============================================================================
 print("Calculating soil temperature and moisture from WRF...")
@@ -726,9 +929,6 @@ for varbc in met_vars:
 # WRF numerical advection can produce supersaturated qv (>100% RH).
 # This cap removes those artifacts while preserving realistic moisture.
 print("Capping boundary QVAPOR at 99.9% RH...")
-Rd_gas = 287.0
-cp_gas = 1005.0
-p0_ref = 100000.0
 
 # Convert pt to T: T = pt * (p / p0)^(Rd/cp)
 # Then compute q_sat(T, p) and cap QVAPOR
@@ -892,9 +1092,11 @@ for species in list(ds_palm_we.data_vars):
             ds_palm_sn[species] = ds_palm_sn[species].ffill('z').bfill('z').fillna(0)
 
 #===============================================================================
-# Top Boundary
+# Top Boundary — CORRECTLY extracted from PALM domain top after vertical interpolation
+# FIX: Previously used WRF model top (bottom_top=-1). Now uses PALM's top z-level.
 #===============================================================================
 print("\nProcessing top boundary conditions...")
+print("  NOTE: Using PALM domain top z-level (not WRF model top)")
 
 u_top = np.zeros((len(all_ts), len(y), len(xu)), dtype=np.float32)
 v_top = np.zeros((len(all_ts), len(yv), len(x)), dtype=np.float32)
@@ -908,23 +1110,51 @@ available_top_species = [s for s in all_chem_to_process if s in ds_interp.data_v
 for species in available_top_species:
     chem_top[species] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
 
+# Top z-levels to interpolate to
+z_top_palm_scalar = z[-1]  # top scalar level (cell center)
+z_top_palm_w = zw[-1]      # top w level (cell interface)
+
+def _top_zlevel(ds, var, z_target):
+    """Interpolate variable to a single height level, return 2D numpy array."""
+    data = ds.salem.wrf_zlevel(var, levels=[z_target])
+    # data has a 'level' dimension of size 1; extract the 2D slice
+    if 'level' in data.dims:
+        return data.isel(level=0).astype(np.float32).values
+    elif 'z' in data.dims:
+        return data.isel(z=0).astype(np.float32).values
+    else:
+        # fallback: squeeze any size-1 dimension
+        for d in data.dims:
+            if data.sizes[d] == 1:
+                return data.isel({d: 0}).astype(np.float32).values
+        return data.astype(np.float32).values
+
 for ts in tqdm(range(len(all_ts)), desc="Top boundary"):
-    u_top[ts, :, :] = ds_interp_u["U"].isel(time=ts, bottom_top=-1).astype(np.float32)
-    v_top[ts, :, :] = ds_interp_v["V"].isel(time=ts, bottom_top=-1).astype(np.float32)
-    w_top[ts, :, :] = ds_interp["W"].isel(time=ts, bottom_top=-1).astype(np.float32)
-    pt_top[ts, :, :] = ds_interp["pt"].isel(time=ts, bottom_top=-1).astype(np.float32)
-    qv_top[ts, :, :] = ds_interp["QVAPOR"].isel(time=ts, bottom_top=-1).astype(np.float32)
+    # Interpolate to PALM's top z-level (NOT WRF model top)
+    ds_ts = ds_interp.isel(time=ts)
     
+    pt_top[ts, :, :] = _top_zlevel(ds_ts, "pt", z_top_palm_scalar)
+    qv_top[ts, :, :] = _top_zlevel(ds_ts, "QVAPOR", z_top_palm_scalar)
+    w_top[ts, :, :]  = _top_zlevel(ds_ts, "W", z_top_palm_w)
+    
+    # U and V on staggered grids
+    ds_u_ts = ds_interp_u.isel(time=ts) if 'time' in ds_interp_u.dims else ds_interp_u
+    ds_v_ts = ds_interp_v.isel(time=ts) if 'time' in ds_interp_v.dims else ds_interp_v
+    
+    u_top[ts, :, :] = _top_zlevel(ds_u_ts, "U", z_top_palm_scalar)
+    v_top[ts, :, :] = _top_zlevel(ds_v_ts, "V", z_top_palm_scalar)
+    
+    # Chemistry species
     for species in available_top_species:
         if species in ds_interp.data_vars:
-            chem_top[species][ts, :, :] = ds_interp[species].isel(time=ts, bottom_top=-1).astype(np.float32)
+            chem_top[species][ts, :, :] = _top_zlevel(ds_ts, species, z_top_palm_scalar)
 
 # Cap top boundary qv at 99.9% RH
 if "PRESSURE" in ds_interp.data_vars:
     print("Capping top boundary QVAPOR at 99.9% RH...")
     p_top_vals = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
     for ts in range(len(all_ts)):
-        p_top_vals[ts, :, :] = ds_interp["PRESSURE"].isel(time=ts, bottom_top=-1).astype(np.float32)
+        p_top_vals[ts, :, :] = _top_zlevel(ds_interp.isel(time=ts), "PRESSURE", z_top_palm_scalar)
     temp_top = pt_top * (p_top_vals / p0_ref) ** (Rd_gas / cp_gas)
     qv_top = cap_qvapor_at_rh(qv_top, temp_top, p_top_vals, rh_max=0.999)
 
@@ -1086,6 +1316,17 @@ for species in all_chem_to_process:
         chem_data = ds_drop[species].sel(time=dt_start).mean(
             dim=["south_north", "west_east"]).interp(
             {"bottom_top": z}, method=interp_mode).load().data.astype(np.float32)
+        # Fix NaN: PALM z-levels below the lowest WRF level produce NaN.
+        # Fill with nearest valid value (constant extension at the bottom/top).
+        if np.any(np.isnan(chem_data)):
+            valid = ~np.isnan(chem_data)
+            if np.any(valid):
+                idx = np.arange(len(chem_data))
+                chem_data = np.interp(
+                    idx, idx[valid], chem_data[valid],
+                    left=chem_data[idx[valid][0]],
+                    right=chem_data[idx[valid][-1]]
+                ).astype(np.float32)
         chem_init[species] = xr.DataArray(chem_data, dims=['z'], coords={'z': z})
     else:
         chem_init[species] = xr.DataArray(np.zeros(len(z), dtype=np.float32), dims=['z'], coords={'z': z})
@@ -1626,7 +1867,15 @@ if radiation_from_wrf:
 #===============================================================================
 print("\nPreparing NetCDF file...")
 
-nc_output_name = f'dynamic_files/{case_name}_dynamic_{start_year}_{start_month}_{start_day}_{start_hour}'
+if dynamic_driver_path is not None:
+    nc_output_name = dynamic_driver_path
+else:
+    nc_output_name = f'dynamic_files/{case_name}_dynamic_{start_year}_{start_month}_{start_day}_{start_hour}'
+nc_output_dir = os.path.dirname(nc_output_name)
+if nc_output_dir and not os.path.exists(nc_output_dir):
+    os.makedirs(nc_output_dir, exist_ok=True)
+    print(f"Created output directory: {nc_output_dir}")
+
 nc_output = xr.Dataset()
 
 nc_output.attrs['description'] = f'Contains dynamic data from WRF mesoscale. WRF output file: {wrf_file}'
@@ -1634,8 +1883,23 @@ nc_output.attrs['author'] = 'Meteorology: Dongqi Lin; Chemistry, Aerosol and Rad
 nc_output.attrs['institution'] = 'Chair of Model-based Environmental Exposure Science, University of Augsburg'
 nc_output.attrs['history'] = 'Created at ' + time.ctime(time.time())
 nc_output.attrs['source'] = 'netCDF4 python'
-nc_output.attrs['origin_lat'] = float(centlat)
-nc_output.attrs['origin_lon'] = float(centlon)
+# SW corner coordinates (PALM standard: origin = south-west corner)
+if static_driver_path and os.path.exists(static_driver_path):
+    with xr.open_dataset(static_driver_path) as ds_sd:
+        sw_utm_x = float(ds_sd.origin_x)
+        sw_utm_y = float(ds_sd.origin_y)
+        sw_lat = float(ds_sd.origin_lat)
+        sw_lon = float(ds_sd.origin_lon)
+else:
+    sw_utm_x = float(west)
+    sw_utm_y = float(south)
+    trans_utm2wgs = Transformer.from_proj(palm_proj, wgs_proj, always_xy=True)
+    sw_lon, sw_lat = trans_utm2wgs.transform(sw_utm_x, sw_utm_y)
+
+nc_output.attrs['origin_lat'] = sw_lat
+nc_output.attrs['origin_lon'] = sw_lon
+nc_output.attrs['origin_x'] = sw_utm_x
+nc_output.attrs['origin_y'] = sw_utm_y
 nc_output.attrs['z'] = float(0)
 nc_output.attrs['x'] = float(0)
 nc_output.attrs['y'] = float(0)
@@ -1658,33 +1922,140 @@ nc_output['init_soil_m'] = xr.DataArray(init_msoil.astype(np.float32), dims=['zs
 nc_output['init_soil_t'] = xr.DataArray(init_tsoil.astype(np.float32), dims=['zsoil', 'y', 'x'],
     attrs={'units': 'K', 'source': 'WRF', 'long_name': 'soil temperature', 'lod': np.int32(2)})
 
+# ===== MASS BALANCING (U, V, W boundaries) =====
+# From PALM meteo builtin.py: preserves mass continuity across all boundaries
+# Adjusts U(left/right), V(south/north), W(top) by a uniform correction velocity
+if enable_mass_balance:
+    print("\n" + "="*60)
+    print("MASS BALANCING: Correcting U,V,W boundaries for mass continuity")
+    print("="*60)
+    
+    # Layer widths from staggered vertical grid
+    if dz_stretch_factor > 1.0:
+        z_interfaces = np.zeros(nz + 1, dtype=np.float32)
+        z_interfaces[0] = 0.0
+        z_interfaces[1:-1] = zw  # internal interfaces
+        # Extrapolate top interface
+        z_interfaces[-1] = zw[-1] + (zw[-1] - zw[-2]) if nz > 2 else zw[-1] + dz
+        zw_widths = np.diff(z_interfaces)  # (nz,) — one per cell
+    else:
+        zw_widths = np.full(nz, dz, dtype=np.float32)
+    
+    areas_xb = (zw_widths * dy).astype(np.float32)  # (nz,) area per z-face on x-boundaries
+    areas_yb = (zw_widths * dx).astype(np.float32)  # (nz,) area per z-face on y-boundaries
+    areas_zb = dx * dy  # scalar — area of top face
+    
+    total_area = (areas_xb.sum() * ny * 2 + areas_yb.sum() * nx * 2 + areas_zb * nx * ny)
+    
+    for it in tqdm(range(len(all_ts)), desc="Mass balancing"):
+        # U at west/east boundaries on (z, y) grid
+        ux_left = ds_palm_we["U"][it, :, :, 0].data   # (nz, ny)
+        ux_right = ds_palm_we["U"][it, :, :, -1].data  # (nz, ny)
+        
+        # V at south/north boundaries on (z, x) grid
+        vy_south = ds_palm_sn["V"][it, :, 0, :].data   # (nz, nx)
+        vy_north = ds_palm_sn["V"][it, :, -1, :].data  # (nz, nx)
+        
+        # W at top boundary (last w-level) on (y, x) grid
+        w_ztop = w_top[it, :, :]  # (ny, nx)
+        
+        # Compute mass disbalance
+        # Influx positive, outflux negative
+        mass_in = (ux_left * areas_xb[:, np.newaxis]).sum()     # through west
+        mass_out_east = (ux_right * areas_xb[:, np.newaxis]).sum()  # through east
+        mass_out_south = (vy_south * areas_yb[:, np.newaxis]).sum() # through south
+        mass_in_north = (vy_north * areas_yb[:, np.newaxis]).sum()  # through north
+        mass_out_top = (w_ztop * areas_zb).sum()                    # through top
+        
+        mass_disbalance = mass_in - mass_out_east + mass_in_north - mass_out_south - mass_out_top
+        
+        # Uniform correction velocity across all boundaries
+        mass_corr_v = mass_disbalance / total_area
+        
+        if abs(mass_corr_v) > 1e-10:
+            # Apply correction: subtract from influx, add to outflux
+            ds_palm_we["U"][it, :, :, 0].data -= mass_corr_v   # reduce west influx
+            ds_palm_we["U"][it, :, :, -1].data += mass_corr_v  # reduce east outflux
+            ds_palm_sn["V"][it, :, 0, :].data -= mass_corr_v   # reduce south outflux
+            ds_palm_sn["V"][it, :, -1, :].data += mass_corr_v  # reduce north influx
+            w_top[it, :, :] += mass_corr_v                       # reduce top outflux
+            
+            # Recheck
+            mass_in2 = (ds_palm_we["U"][it, :, :, 0].data * areas_xb[:, np.newaxis]).sum()
+            mass_out_e2 = (ds_palm_we["U"][it, :, :, -1].data * areas_xb[:, np.newaxis]).sum()
+            mass_out_s2 = (ds_palm_sn["V"][it, :, 0, :].data * areas_yb[:, np.newaxis]).sum()
+            mass_in_n2 = (ds_palm_sn["V"][it, :, -1, :].data * areas_yb[:, np.newaxis]).sum()
+            mass_out_t2 = (w_top[it] * areas_zb).sum()
+            
+            mass_balanced = mass_in2 - mass_out_e2 + mass_in_n2 - mass_out_s2 - mass_out_t2
+            if abs(mass_balanced) > 1e-6:
+                print(f"    t={it}: corr={mass_corr_v:.6f} m/s, residual={mass_balanced:.6f} m³/s")
+    
+    print("  Mass balancing complete")
+    print("="*60)
+
 # Meteorological variables
+# Use 3D init (LOD=2) only if no SALSA: with LOD=2, PALM leaves pt zero at
+# ghost/boundary grid points, which crashes SALSA's thermodynamic init
+# (ideal_gas_law_rho divide-by-zero). SALSA runs must use LOD=1 (1D profiles),
+# as produced by PALM's INIFOR tool.
+use_3d_met_init = (write_init_3d and 'init_3d_vars' in dir()
+                   and len(init_3d_vars) > 0 and not aerosol_wrfchem)
+if use_3d_met_init:
+    met_init_pt = init_3d_vars['pt'].astype(np.float32)
+    met_init_qv = init_3d_vars['QVAPOR'].astype(np.float32)
+    met_init_u  = init_3d_vars['U'].astype(np.float32)
+    met_init_v  = init_3d_vars['V'].astype(np.float32)
+    met_init_w  = init_3d_vars['W'].astype(np.float32)
+    init_lod = np.int32(2)
+    init_pt_dims = ['z', 'y', 'x']
+    init_qv_dims = ['z', 'y', 'x']
+    init_u_dims  = ['z', 'y', 'xu']
+    init_v_dims  = ['z', 'yv', 'x']
+    init_w_dims  = ['zw', 'y', 'x']
+else:
+    if aerosol_wrfchem:
+        print("  Met init: LOD=1 (1D profiles) - required for SALSA/aerosol "
+              "(3D/LOD=2 met init would crash PALM: divide-by-zero in "
+              "ideal_gas_law_rho during salsa_init)")
+    met_init_pt = pt_init.astype(np.float32)
+    met_init_qv = qv_init.astype(np.float32)
+    met_init_u  = u_init.astype(np.float32)
+    met_init_v  = v_init.astype(np.float32)
+    met_init_w  = w_init.astype(np.float32)
+    init_lod = np.int32(1)
+    init_pt_dims = ['z']
+    init_qv_dims = ['z']
+    init_u_dims  = ['z']
+    init_v_dims  = ['z']
+    init_w_dims  = ['zw']
+
 met_vars_output = [
-    ('init_atmosphere_pt', pt_init.astype(np.float32), ['z'], {'units': 'K', 'lod': np.int32(1)}),
+    ('init_atmosphere_pt', met_init_pt, init_pt_dims, {'units': 'K', 'lod': init_lod}),
     ('ls_forcing_left_pt', ds_palm_we["pt"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'K'}),
     ('ls_forcing_right_pt', ds_palm_we["pt"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'K'}),
     ('ls_forcing_south_pt', ds_palm_sn["pt"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'K'}),
     ('ls_forcing_north_pt', ds_palm_sn["pt"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'K'}),
     ('ls_forcing_top_pt', pt_top.astype(np.float32), ['time', 'y', 'x'], {'units': 'K'}),
-    ('init_atmosphere_qv', qv_init.astype(np.float32), ['z'], {'units': 'kg/kg', 'lod': np.int32(1)}),
+    ('init_atmosphere_qv', met_init_qv, init_qv_dims, {'units': 'kg/kg', 'lod': init_lod}),
     ('ls_forcing_left_qv', ds_palm_we["QVAPOR"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'kg/kg'}),
     ('ls_forcing_right_qv', ds_palm_we["QVAPOR"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'kg/kg'}),
     ('ls_forcing_south_qv', ds_palm_sn["QVAPOR"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'kg/kg'}),
     ('ls_forcing_north_qv', ds_palm_sn["QVAPOR"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'kg/kg'}),
     ('ls_forcing_top_qv', qv_top.astype(np.float32), ['time', 'y', 'x'], {'units': 'kg/kg'}),
-    ('init_atmosphere_u', u_init.astype(np.float32), ['z'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('init_atmosphere_u', met_init_u, init_u_dims, {'units': 'm/s', 'lod': init_lod}),
     ('ls_forcing_left_u', ds_palm_we["U"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'm/s'}),
     ('ls_forcing_right_u', ds_palm_we["U"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'y'], {'units': 'm/s'}),
     ('ls_forcing_south_u', ds_palm_sn["U"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'xu'], {'units': 'm/s'}),
     ('ls_forcing_north_u', ds_palm_sn["U"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'xu'], {'units': 'm/s'}),
     ('ls_forcing_top_u', u_top.astype(np.float32), ['time', 'y', 'xu'], {'units': 'm/s'}),
-    ('init_atmosphere_v', v_init.astype(np.float32), ['z'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('init_atmosphere_v', met_init_v, init_v_dims, {'units': 'm/s', 'lod': init_lod}),
     ('ls_forcing_left_v', ds_palm_we["V"][:, :, :, 0].data.astype(np.float32), ['time', 'z', 'yv'], {'units': 'm/s'}),
     ('ls_forcing_right_v', ds_palm_we["V"][:, :, :, -1].data.astype(np.float32), ['time', 'z', 'yv'], {'units': 'm/s'}),
     ('ls_forcing_south_v', ds_palm_sn["V"][:, :, 0, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'm/s'}),
     ('ls_forcing_north_v', ds_palm_sn["V"][:, :, -1, :].data.astype(np.float32), ['time', 'z', 'x'], {'units': 'm/s'}),
     ('ls_forcing_top_v', v_top.astype(np.float32), ['time', 'yv', 'x'], {'units': 'm/s'}),
-    ('init_atmosphere_w', w_init.astype(np.float32), ['zw'], {'units': 'm/s', 'lod': np.int32(1)}),
+    ('init_atmosphere_w', met_init_w, init_w_dims, {'units': 'm/s', 'lod': init_lod}),
     ('ls_forcing_left_w', ds_palm_we["W"][:, :, :, 0].data.astype(np.float32), ['time', 'zw', 'y'], {'units': 'm/s'}),
     ('ls_forcing_right_w', ds_palm_we["W"][:, :, :, -1].data.astype(np.float32), ['time', 'zw', 'y'], {'units': 'm/s'}),
     ('ls_forcing_south_w', ds_palm_sn["W"][:, :, 0, :].data.astype(np.float32), ['time', 'zw', 'x'], {'units': 'm/s'}),
@@ -1714,16 +2085,26 @@ for species in original_chem_species:
     else:
         output_name = chem_name_mapping.get(species, species.upper())
     
+    # PALM requires chemistry init_atmosphere_* variables to be LOD=1 (1D
+    # profiles). LOD=2 (3D volume data) is only allowed for the meteorological
+    # variables (pt, qv, u, v, w), not for chemistry. Writing lod=2 chemistry
+    # triggers PALM error DRV0007.
     if species in chem_init:
         if species in ['PM10', 'PM2_5_DRY'] or species.replace('_tra', '') in ['PM10', 'PM2_5_DRY']:
-            data = chem_init[species].data * MICROGRAM_TO_KG
-            units = 'kg/m3'
+            init_data = chem_init[species].data * MICROGRAM_TO_KG
+            init_units = 'kg/m3'
         else:
-            data = chem_init[species].data
-            units = 'ppm'
-        
-        nc_output[f'init_atmosphere_{output_name}'] = xr.DataArray(data.astype(np.float32), dims=['z'], 
-            attrs={'units': units, 'source': 'WRF-Chem', 'lod': np.int32(1)})
+            init_data = chem_init[species].data
+            init_units = 'ppm'
+        init_dims = ['z']
+        init_lod_chem = np.int32(1)
+    else:
+        init_data = None
+    
+    if init_data is not None:
+        nc_output[f'init_atmosphere_{output_name}'] = xr.DataArray(
+            init_data.astype(np.float32), dims=init_dims,
+            attrs={'units': init_units, 'source': 'WRF-Chem', 'lod': init_lod_chem})
     
     if species in ds_palm_we.data_vars:
         if species in ['PM10', 'PM2_5_DRY'] or species.replace('_tra', '') in ['PM10', 'PM2_5_DRY']:
