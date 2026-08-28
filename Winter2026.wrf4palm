@@ -1,0 +1,94 @@
+[case]
+case_name = "Winter2026",
+max_pool = 32,
+geostrophic = " ", ## calculate geostrophic wind using the variable pressure (option "p") or geopotential height  (option "z")
+
+[domain]
+# Static driver path - auto-reads nx, ny, dx, dy, centlat, centlon, z_origin
+static_driver_path = "/hpc/gpfs2/scratch/u/vaithisa/palm_25.10/palm_mbees/palm/JOBS/WRF_paper128/INPUT/WRF_paper128_static"
+# Manual overrides (optional - uncomment to override static driver values)
+palm_proj = "EPSG:25832",
+# centlat = 48.38497,
+# centlon = 10.84222,
+# nx = 256,
+# ny = 256,
+# dx = 32.0,
+# dy = 32.0,
+# z_origin = 486.0,
+# nz and dz are always required (not in static driver)
+nz = 96,
+dz = 8.0,
+
+[stretch]
+dz_stretch_factor = 1.0,         # stretch factor for a vertically stretched grid
+                                # set this to 1.0 if no streching required
+dz_stretch_level = 400.0,      # Height level above which the grid is to be stretched vertically (in m)
+dz_max = 50.0,                  # allowed maximum vertical grid spacing (in m)
+
+[wrf]
+wrf_path = "/hpc/gpfs2/home/u/vaithisa/UniA/WRF4PALM_v1.1.2/wrf_output/", 
+wrf_output = "wrfout_d02_2026-03-*",   
+interp_mode = "linear",  #"nearest" "linear"
+
+start_year = 2026,
+start_month = 3,
+start_day = 6,
+start_hour = 21,
+
+end_year = 2026,
+end_month = 3,
+end_day = 9,
+end_hour = 23,
+
+dynamic_ts = 3600.0,         # PALM dynamic driver update frequency
+
+[soil]
+# layers for soil temperature and moisture calculation
+# this shall be changed depending on different cases
+dz_soil = 0.01, 0.02, 0.04, 0.06, 0.14, 0.26, 0.54, 1.86,
+msoil = 0.3, # dummy value in case soil moisture from WRF output is 0.0
+
+[chemistry] 
+#species = ["hno3","ho2","ho","no2","o3","no","nh3","sulf","RH","RO2","RCHO","OCSV","OCNV","PM10","PM2_5_DRY",
+        #  "no2_tra","no_tra","PM10_tra","PM2_5_DRY_tra",
+         #  "hno3_tra","ho2_tra","ho_tra","nh3_tra","sulf_tra","o3_tra",
+          # "RH_tra","RO2_tra","RCHO_tra","OCSV_tra","OCNV_tra"]
+# species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "PM10","PM2_5_DRY", "no2_tra","no_tra", "PM10_tra","PM2_5_DRY_tra"]   #all_species
+ species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "so2", "RH", "RO2", "RCHO", "OCSV", "OCNV", "PM10","PM2_5_DRY"]   #salsa+simple, remove pm10 and pm2.5 later.
+# species = ["hno3","ho2","ho","no2","o3","no","nh3", "sulf", "RH", "RO2", "RCHO", "OCSV", "OCNV", "no2_traffic","no_traffic"]   #salsa+simple_tra
+# species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no", "no2_traffic","no_traffic"]   #simple_traffic
+# species = ["hno3","RCHO","RH","ho2","no2","RO2","ho","o3","no"]   #simplec
+# species = ["PM10","PM2_5_DRY"] #passive
+# species = []
+# chemical species to include from WRF-Chem - "PM10","PM2_5_DRY","hno3","ho2","ho","no2","o3","no","nh3","so2","co", "sulf", "RH","RO2","RCHO","OCSV", "OCNV"
+
+[radiation]
+# Radiation settings 
+radiation_from_wrf = True,
+radiation_smoothing_distance = 10000.0,  # Distance (in meters) around domain center to average radiation data
+
+[aerosol]
+# Aerosol processing settings
+aerosol_wrfchem = True,                     # Enable aerosol processing
+listspec = ['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH'],
+#listspec = ['SO4', 'OC', 'BC', 'DU', 'SS', 'NO', 'NH', 'PB', 'HG', 'NI', 'CD', 'AS'],
+nbin = [3, 7],                              # Number of bins in each subrange [bins in subrange 1, bins in subrange 2]
+reglim = [3.9e-8, 1.56e-7, 1.0e-5],        #[3.9e-8, 5.0e-8, 2.5e-6],  # Bin limits (m) [d_min, d_split, d_max] in meters
+wrfchem_bin_limits = [3.9e-8, 1.56e-7, 6.25e-7, 2.5e-6, 1.0e-5],  # WRF-Chem bin limits
+nf2a = 1.0,                                 # Soluble/insoluble fraction factor
+
+[output]
+# Custom output path for the dynamic driver (optional)
+# If not specified, defaults to dynamic_files/{case_name}_dynamic_{start_year}_{start_month}_{start_day}_{start_hour}
+ dynamic_driver_path = "/hpc/gpfs2/scratch/u/vaithisa/palm_25.10/palm_mbees/palm/JOBS/WRF_paper128/INPUT/WRF_paper128_dynamic"
+
+# Write init_atmosphere_* as 3D volume data (LOD=2) following PALM PIDS_DYNAMIC format:
+#   init_atmosphere_pt: (z, y, x), init_atmosphere_u: (z, y, xu), etc.
+# When True (default), full 3D fields are produced with LOD=2.
+# When False, falls back to 1D profiles with LOD=1 (original behavior).
+write_init_3d = False,
+
+# Enable mass balancing (continuity correction) on U, V, W boundaries
+# Applies uniform correction velocity to all boundaries to ensure mass conservation.
+# This mirrors the approach used by PALM-METEO (palm_meteo/core/builtin.py).
+enable_mass_balance = True,

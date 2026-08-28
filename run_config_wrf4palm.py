@@ -1421,17 +1421,15 @@ if aerosol_wrfchem:
     print("STEP 1: Calculating aerosol initial profiles (with unit conversion)...")
     print("-"*40)
     
-    # Get ALT for unit conversion (domain mean at initial time)
-    alt_init_data = ds_wrf['ALT'].isel(
-        time=0,
-        west_east=slice(west_idx, east_idx + 1),
-        south_north=slice(south_idx, north_idx + 1)
-    ).mean().values
-    
-    air_density_init = get_air_density(alt_init_data, "ALT_init")
-    
-    print(f"    ALT (inverse density) from WRF: {extract_scalar_from_xarray(alt_init_data):.4f} m3/kg")
-    print(f"    Air density for unit conversion: {air_density_init:.3f} kg/m3")
+    # FIX (Bug 1): level-local air density on the PALM z grid (ideal gas law).
+    # The old code used the full-column mean of WRF ALT (~0.36 kg/m3) for every
+    # level, which under-converts #/kg -> #/m3 by ~3x near the surface.
+    temp_init_K = pt_init * (p_init / p0_ref) ** (Rd_gas / cp_gas)
+    rho_init = p_init / (Rd_gas * temp_init_K * (1.0 + 0.61 * qv_init))   # (nz,) kg/m3
+    rho_init = np.clip(np.nan_to_num(rho_init, nan=1.2, posinf=1.2, neginf=1.2), 0.2, 3.0)
+    air_density_init = float(rho_init[0])
+    print(f"    Air density profile (level-local, kg/m3): surface={rho_init[0]:.3f}  "
+          f"top(z={z[-1]:.0f} m)={rho_init[-1]:.4f}")
     
     # Initialize mass matrix (kg/m3 for each species)
     mass_matrix = np.zeros((len(z), n_species), dtype=np.float32)
@@ -1445,8 +1443,8 @@ if aerosol_wrfchem:
             for bin_suffix in WRFCHEM_BIN_SUFFIXES:
                 var_name = f'{wrf_name}{bin_suffix}'
                 if var_name in chem_init:
-                    # Convert ug/kg-dryair -> kg/m3
-                    mass_matrix[:, idx] += chem_init[var_name].values * 1e-9 * air_density_init
+                    # Convert ug/kg-dryair -> kg/m3 (level-local density)
+                    mass_matrix[:, idx] += chem_init[var_name].values * 1e-9 * rho_init
     
     # Add trace metals
     trace_metal_added = False
@@ -1489,12 +1487,12 @@ if aerosol_wrfchem:
     #if nf2a < 1.0:
     #    mass_fracs_b_init = enforce_exact_sum_to_one(mass_fracs_b_init, axis=-1)
     
-    # Collect WRF number concentrations (#/kg -> #/m3)
+    # Collect WRF number concentrations (#/kg -> #/m3) with level-local density
     wrf_num_matrix = np.zeros((len(z), n_wrf_bins), dtype=np.float32)
     for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
         num_var = f'num{bin_suffix}'
         if num_var in chem_init:
-            wrf_num_matrix[:, wbin] = chem_init[num_var].values * air_density_init
+            wrf_num_matrix[:, wbin] = chem_init[num_var].values * rho_init
     
     print(f"    WRF number conc. range: {wrf_num_matrix.min():.2e} - {wrf_num_matrix.max():.2e} #/m3")
     
@@ -1510,6 +1508,15 @@ if aerosol_wrfchem:
         aerosol_concentration_init = np.concatenate([conc_1, conc_2a, conc_2b], axis=1)
     else:
         aerosol_concentration_init = aerosol_conc_10bin
+    
+    # FIX (Bug 2): rescale the per-bin numbers so the implied SALSA mass equals
+    # the WRF-Chem mass fields (WRF num_a0X overpredict mass and the number-
+    # overlap mapping inflates it via the D^3 volume term).  Size-dist. shape kept.
+    aerosol_concentration_init, _scale_init = rescale_number_to_target_mass(
+        aerosol_concentration_init, dmid_all, mass_matrix, listspec)
+    print(f"    [Bug2 fix] init numbers rescaled by mean factor {np.nanmean(_scale_init):.3f} "
+          f"-> implied mass = WRF mass fields "
+          f"({np.nanmean(np.sum(mass_matrix, axis=-1)) * 1e9:.2f} ug/m3 at surface)")
     
     chem_init['mass_fracs_a'] = xr.DataArray(mass_fracs_a_init.astype(np.float32), 
                                               dims=['z', 'composition_index'])
@@ -1564,16 +1571,16 @@ if aerosol_wrfchem:
     
     # ----- West/East Boundaries -----
     print("  Processing West/East boundaries...")
+    # FIX (Bug 1): level-local air density from boundary met fields (PALM z grid),
+    # replaces the old full-column-mean WRF ALT (which was ~3x too low near surface).
+    pres_we = ds_palm_we['PRESSURE'].values
+    temp_we = ds_palm_we['pt'].values * (pres_we / p0_ref) ** (Rd_gas / cp_gas)
+    rho_we = pres_we / (Rd_gas * temp_we * (1.0 + 0.61 * ds_palm_we['QVAPOR'].values))
+    rho_we = np.clip(np.nan_to_num(rho_we, nan=1.2, posinf=1.2, neginf=1.2), 0.2, 3.0)
+    
     for ts in tqdm(range(len(all_ts)), desc="  West/East", leave=False):
         current_time = all_ts[ts]
         wrf_time_idx = np.argmin(np.abs(ds_wrf.time.values - current_time))
-        
-        alt_we_data = alt_wrf.isel(time=wrf_time_idx).isel(
-            west_east=slice(west_idx, east_idx + 1),
-            south_north=slice(south_idx, north_idx + 1)
-        ).mean().values
-        
-        air_density_we = get_air_density(alt_we_data, f"ALT_we_t{ts}")
         
         for zlev in range(len(z)):
             wrf_num_left = np.zeros((len(y), n_wrf_bins), dtype=np.float32)
@@ -1582,8 +1589,8 @@ if aerosol_wrfchem:
             for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
                 num_var = f'num{bin_suffix}'
                 if num_var in ds_palm_we.data_vars:
-                    wrf_num_left[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=0).data * air_density_we
-                    wrf_num_right[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=-1).data * air_density_we
+                    wrf_num_left[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=0).data * rho_we[ts, zlev, :, 0]
+                    wrf_num_right[:, wbin] = ds_palm_we[num_var].isel(time=ts, z=zlev, x=-1).data * rho_we[ts, zlev, :, -1]
             
             left_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_left, overlap_ratio)
             right_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_right, overlap_ratio)
@@ -1613,13 +1620,13 @@ if aerosol_wrfchem:
                         var_name = f'{wrf_name}{bin_suffix}'
                         if var_name in ds_palm_we.data_vars:
                             left_mass_orig[ts, zlev, :, idx] += ds_palm_we[var_name].isel(
-                                time=ts, z=zlev, x=0).data * 1e-9 * air_density_we
+                                time=ts, z=zlev, x=0).data * 1e-9 * rho_we[ts, zlev, :, 0]
                             right_mass_orig[ts, zlev, :, idx] += ds_palm_we[var_name].isel(
-                                time=ts, z=zlev, x=-1).data * 1e-9 * air_density_we
+                                time=ts, z=zlev, x=-1).data * 1e-9 * rho_we[ts, zlev, :, -1]
             
             if 'PM2_5_DRY' in ds_palm_we.data_vars:
-                pm25_left = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=0).data * 1e-9 * air_density_we
-                pm25_right = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=-1).data * 1e-9 * air_density_we
+                pm25_left = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=0).data * 1e-9 * rho_we[ts, zlev, :, 0]
+                pm25_right = ds_palm_we['PM2_5_DRY'].isel(time=ts, z=zlev, x=-1).data * 1e-9 * rho_we[ts, zlev, :, -1]
                 
                 for idx, spec in enumerate(listspec):
                     if is_trace_metal(spec):
@@ -1627,19 +1634,24 @@ if aerosol_wrfchem:
                         frac_right = get_trace_metal_mass_fraction(spec, street_type_we[:, 1])
                         left_mass_orig[ts, zlev, :, idx] = pm25_left * frac_left
                         right_mass_orig[ts, zlev, :, idx] = pm25_right * frac_right
+            
+            # FIX (Bug 2): boundary SALSA mass = WRF-Chem mass fields
+            left_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
+                left_aerosol[ts, zlev, :, :], dmid_all, left_mass_orig[ts, zlev, :, :], listspec)[0]
+            right_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
+                right_aerosol[ts, zlev, :, :], dmid_all, right_mass_orig[ts, zlev, :, :], listspec)[0]
     
     # ----- South/North Boundaries -----
     print("  Processing South/North boundaries...")
+    # FIX (Bug 1): level-local air density from boundary met fields (PALM z grid)
+    pres_sn = ds_palm_sn['PRESSURE'].values
+    temp_sn = ds_palm_sn['pt'].values * (pres_sn / p0_ref) ** (Rd_gas / cp_gas)
+    rho_sn = pres_sn / (Rd_gas * temp_sn * (1.0 + 0.61 * ds_palm_sn['QVAPOR'].values))
+    rho_sn = np.clip(np.nan_to_num(rho_sn, nan=1.2, posinf=1.2, neginf=1.2), 0.2, 3.0)
+    
     for ts in tqdm(range(len(all_ts)), desc="  South/North", leave=False):
         current_time = all_ts[ts]
         wrf_time_idx = np.argmin(np.abs(ds_wrf.time.values - current_time))
-        
-        alt_sn_data = alt_wrf.isel(time=wrf_time_idx).isel(
-            west_east=slice(west_idx, east_idx + 1),
-            south_north=slice(south_idx, north_idx + 1)
-        ).mean().values
-        
-        air_density_sn = get_air_density(alt_sn_data, f"ALT_sn_t{ts}")
         
         for zlev in range(len(z)):
             wrf_num_south = np.zeros((len(x), n_wrf_bins), dtype=np.float32)
@@ -1648,8 +1660,8 @@ if aerosol_wrfchem:
             for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
                 num_var = f'num{bin_suffix}'
                 if num_var in ds_palm_sn.data_vars:
-                    wrf_num_south[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=0).data * air_density_sn
-                    wrf_num_north[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=-1).data * air_density_sn
+                    wrf_num_south[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=0).data * rho_sn[ts, zlev, 0, :]
+                    wrf_num_north[:, wbin] = ds_palm_sn[num_var].isel(time=ts, z=zlev, y=-1).data * rho_sn[ts, zlev, -1, :]
             
             south_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_south, overlap_ratio)
             north_conc_10bin = vectorized_batch_aerosol_mapping(wrf_num_north, overlap_ratio)
@@ -1679,13 +1691,13 @@ if aerosol_wrfchem:
                         var_name = f'{wrf_name}{bin_suffix}'
                         if var_name in ds_palm_sn.data_vars:
                             south_mass_orig[ts, zlev, :, idx] += ds_palm_sn[var_name].isel(
-                                time=ts, z=zlev, y=0).data * 1e-9 * air_density_sn
+                                time=ts, z=zlev, y=0).data * 1e-9 * rho_sn[ts, zlev, 0, :]
                             north_mass_orig[ts, zlev, :, idx] += ds_palm_sn[var_name].isel(
-                                time=ts, z=zlev, y=-1).data * 1e-9 * air_density_sn
+                                time=ts, z=zlev, y=-1).data * 1e-9 * rho_sn[ts, zlev, -1, :]
             
             if 'PM2_5_DRY' in ds_palm_sn.data_vars:
-                pm25_south = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=0).data * 1e-9 * air_density_sn
-                pm25_north = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=-1).data * 1e-9 * air_density_sn
+                pm25_south = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=0).data * 1e-9 * rho_sn[ts, zlev, 0, :]
+                pm25_north = ds_palm_sn['PM2_5_DRY'].isel(time=ts, z=zlev, y=-1).data * 1e-9 * rho_sn[ts, zlev, -1, :]
                 
                 for idx, spec in enumerate(listspec):
                     if is_trace_metal(spec):
@@ -1693,6 +1705,12 @@ if aerosol_wrfchem:
                         frac_north = get_trace_metal_mass_fraction(spec, street_type_sn[1, :])
                         south_mass_orig[ts, zlev, :, idx] = pm25_south * frac_south
                         north_mass_orig[ts, zlev, :, idx] = pm25_north * frac_north
+            
+            # boundary SALSA mass = WRF-Chem mass fields
+            south_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
+                south_aerosol[ts, zlev, :, :], dmid_all, south_mass_orig[ts, zlev, :, :], listspec)[0]
+            north_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
+                north_aerosol[ts, zlev, :, :], dmid_all, north_mass_orig[ts, zlev, :, :], listspec)[0]
     
     # ----- Top Boundary -----
     print("  Processing Top boundary...")
@@ -1700,18 +1718,16 @@ if aerosol_wrfchem:
         current_time = all_ts[ts]
         wrf_time_idx = np.argmin(np.abs(ds_wrf.time.values - current_time))
         
-        alt_top_data = alt_wrf.isel(time=wrf_time_idx).isel(
-            west_east=slice(west_idx, east_idx + 1),
-            south_north=slice(south_idx, north_idx + 1)
-        ).mean().values
-        
-        air_density_top = get_air_density(alt_top_data, f"ALT_top_t{ts}")
+        # FIX (Bug 1): air density at the PALM top level (mean over boundary columns)
+        rho_top = float(np.nanmean(rho_we[ts, -1, :, :]))
+        if not np.isfinite(rho_top) or rho_top <= 0.0:
+            rho_top = 1.0
         
         wrf_num_top = np.zeros((len(y), len(x), n_wrf_bins), dtype=np.float32)
         for wbin, bin_suffix in enumerate(WRFCHEM_BIN_SUFFIXES):
             num_var = f'num{bin_suffix}'
             if num_var in chem_top:
-                wrf_num_top[:, :, wbin] = chem_top[num_var][ts, :, :] * air_density_top
+                wrf_num_top[:, :, wbin] = chem_top[num_var][ts, :, :] * rho_top
         
         wrf_num_top_flat = wrf_num_top.reshape(-1, n_wrf_bins)
         top_conc_10bin_flat = vectorized_batch_aerosol_mapping(wrf_num_top_flat, overlap_ratio)
@@ -1734,14 +1750,18 @@ if aerosol_wrfchem:
                 for bin_suffix in WRFCHEM_BIN_SUFFIXES:
                     var_name = f'{wrf_name}{bin_suffix}'
                     if var_name in chem_top:
-                        top_mass_orig[ts, :, :, idx] += chem_top[var_name][ts, :, :] * 1e-9 * air_density_top
+                        top_mass_orig[ts, :, :, idx] += chem_top[var_name][ts, :, :] * 1e-9 * rho_top
         
         if 'PM2_5_DRY' in chem_top:
-            pm25_top = chem_top['PM2_5_DRY'][ts, :, :] * 1e-9 * air_density_top
+            pm25_top = chem_top['PM2_5_DRY'][ts, :, :] * 1e-9 * rho_top
             for idx, spec in enumerate(listspec):
                 if is_trace_metal(spec):
                     frac_top = get_trace_metal_mass_fraction(spec, street_type_surface)
                     top_mass_orig[ts, :, :, idx] = pm25_top * frac_top
+        
+        # FIX (Bug 2): top-boundary SALSA mass = WRF-Chem mass fields
+        top_aerosol[ts, :, :, :] = rescale_number_to_target_mass(
+            top_aerosol[ts, :, :, :], dmid_all, top_mass_orig[ts, :, :, :], listspec)[0]
     
     # ===== STEP 3: Normalize Boundary Mass Fractions =====
     print("\n" + "-"*40)
@@ -2072,7 +2092,7 @@ MICROGRAM_TO_KG = 1e-9
 chem_name_mapping = {
     "hno3": "HNO3", "ho2": "HO2", "ho": "OH", "no2": "NO2", "o3": "O3",
     "no": "NO", "nh3": "NH3", "so2": "SO2", "co": "CO", "sulf": "H2SO4",
-    "RH": "RH", "RO2": "RO2", "RCHO": "RCHO", "PM10": "PM10", "PM2_5_DRY": "PM25"
+    "RH": "RH", "RO2": "RO2", "RCHO": "RCHO", "PM10": "PM10", "PM2_5_DRY": "PM25", "so2": "SO2"
 }
 
 for species in original_chem_species:

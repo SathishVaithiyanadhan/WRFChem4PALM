@@ -271,6 +271,53 @@ def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
 
 
 # ==============================================================================
+# Species dry densities (kg/m3) - should match the SALSA density table
+# ==============================================================================
+SPECIES_DENSITY = {
+    'SO4': 1.77e3, 'NO': 1.72e3, 'NH': 1.75e3, 'BC': 2.00e3, 'OC': 1.40e3,
+    'SS': 2.17e3, 'DU': 2.65e3,
+    'PB': 11.34e3, 'HG': 13.53e3, 'NI': 8.90e3, 'CD': 8.65e3, 'AS': 5.72e3,
+}
+
+
+def species_density_array(listspec):
+    """Per-species dry densities (kg/m3) in listspec order."""
+    return np.array([SPECIES_DENSITY.get(s, 2.0e3) for s in listspec],
+                    dtype=np.float32)
+
+
+def rescale_number_to_target_mass(num_matrix, dmid, mass_matrix, listspec,
+                                  floor=1e-30):
+    """
+    FIX (Bug 2): rescale per-bin number concentrations so that the dry aerosol
+    mass implied by the numbers equals the WRF-Chem mass-field total.
+
+    num_matrix : (..., nbins) bin number concentrations [#/m3]
+    dmid      : (nbins,) PALM bin mid diameters [m]
+    mass_matrix: (..., n_species) WRF-Chem mass fields converted to kg/m3
+    listspec  : species names (order matching the last axis of mass_matrix)
+
+    The WRF-Chem number fields (num_a0X) are not mass-consistent with the mass
+    fields / PM10_DRY, and the number-overlap bin mapping inflates mass (D^3
+    effect).  This keeps the WRF size-distribution SHAPE (relative bin number)
+    but forces the absolute SALSA mass to equal the WRF-Chem mass fields.
+
+    Returns (rescaled_num_matrix, scale).
+    """
+    num_matrix = np.asarray(num_matrix, dtype=np.float32)
+    mass_matrix = np.asarray(mass_matrix, dtype=np.float32)
+    total_mass = np.sum(mass_matrix, axis=-1)                     # (...) kg/m3
+    fracs = mass_matrix / np.maximum(total_mass[..., np.newaxis], 1e-30)
+    dens_p = species_density_array(listspec)
+    mean_dens = np.sum(fracs * dens_p, axis=-1)                   # (...) kg/m3
+    vol = np.pi / 6.0 * np.asarray(dmid, dtype=np.float32) ** 3   # (nbins,) m3
+    implied = np.sum(num_matrix * vol, axis=-1) * mean_dens       # (...) kg/m3
+    scale = np.where(implied > floor, total_mass / np.maximum(implied, floor), 1.0)
+    scale = np.clip(scale, 0.0, 1e6)
+    return (num_matrix * scale[..., np.newaxis]).astype(np.float32), scale
+
+
+# ==============================================================================
 # Unit Conversion Function (CRITICAL FIX)
 # ==============================================================================
 
