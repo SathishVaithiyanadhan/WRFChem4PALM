@@ -26,7 +26,7 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
         # Process all levels in main process (no pickling)
         for lvl in zcoord:
             data = ds_in.salem.wrf_zlevel(var, levels=lvl, use_multiprocessing=False)
-            data = data.astype(np.float32)
+            data = np.asarray(data, dtype=np.float32)
             
             if is_w:
                 ds_out[var].loc[dict(zw=lvl)] = data
@@ -44,7 +44,7 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
     # Extract all levels at once using vectorized salem operation
     try:
         all_data = ds_in.salem.wrf_zlevel(var, levels=zcoord, use_multiprocessing=False)
-        all_data = all_data.astype(np.float32)
+        all_data = np.asarray(all_data, dtype=np.float32)   # see note above
         
         # Then assign results (no parallel needed)
         if is_w:
@@ -61,7 +61,7 @@ def multi_zinterp(max_pool, ds_in, var, zcoord, ds_out):
         print(f"    Level-by-level interpolation for {var}")
         for lvl in tqdm(zcoord, desc=f"    {var}", leave=False):
             data = ds_in.salem.wrf_zlevel(var, levels=lvl, use_multiprocessing=False)
-            data = data.astype(np.float32)
+            data = np.asarray(data, dtype=np.float32)   # see note above
             
             if is_w:
                 ds_out[var].loc[dict(zw=lvl)] = data

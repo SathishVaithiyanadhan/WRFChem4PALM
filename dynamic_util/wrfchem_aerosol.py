@@ -274,9 +274,9 @@ def create_separated_mass_fractions(mass_array, listspec, nf2a=0.75):
 # Species dry densities (kg/m3) - should match the SALSA density table
 # ==============================================================================
 SPECIES_DENSITY = {
-    'SO4': 1.77e3, 'NO': 1.72e3, 'NH': 1.75e3, 'BC': 2.00e3, 'OC': 1.40e3,
-    'SS': 2.17e3, 'DU': 2.65e3,
-    'PB': 11.34e3, 'HG': 13.53e3, 'NI': 8.90e3, 'CD': 8.65e3, 'AS': 5.72e3,
+    'SO4': 1830.0, 'NO': 1479.0, 'NH': 1530.0, 'BC': 2000.0, 'OC': 2000.0,
+    'SS': 2165.0, 'DU': 2650.0,
+    'PB': 11340.0, 'HG': 13534.0, 'NI': 8908.0, 'CD': 8650.0, 'AS': 5727.0,
 }
 
 

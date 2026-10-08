@@ -10,6 +10,7 @@ FIXED: Scalar extraction from xarray .values for air density calculation
 
 import sys
 import os
+import re
 import time
 import gc
 import warnings
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from glob import glob
 from math import floor, ceil
+from collections import Counter
 
 # ===== MEMORY OPTIMIZATION: Set float32 as default =====
 np.float_ = np.float32
@@ -73,7 +75,7 @@ def enforce_exact_sum_to_one(array, axis=-1):
     
     # Build index for last element along target axis
     # For a 2D array (z, species) with axis=-1:
-    # We want [: , -1] - all z-levels, last species
+    # [: , -1] - all z-levels, last species
     last_idx = [slice(None)] * arr_f64.ndim
     last_idx[axis] = -1
     
@@ -183,6 +185,17 @@ config.read(sys.argv[1])
 case_name = ast.literal_eval(config.get("case", "case_name"))[0]
 max_pool = ast.literal_eval(config.get("case", "max_pool"))[0]
 geostr_lvl = ast.literal_eval(config.get("case", "geostrophic"))[0]
+
+# ===== CAP SALEM'S INTERNAL WORKER POOL =====
+# handling multifiles in the input data folder efficiently
+import multiprocessing as mp
+import salem.wrftools as _salem_wrftools
+
+_salem_pool_workers = max(1, min(int(max_pool), 16))
+if _salem_wrftools.POOL is None:
+    _salem_wrftools.POOL = mp.Pool(processes=_salem_pool_workers)
+    print(f"Salem interpolation pool capped at {_salem_pool_workers} worker(s) "
+          f"instead of {os.cpu_count()} to save file descriptors")
 
 # Chemistry species
 chem_species_raw = ast.literal_eval(config.get("chemistry", "species"))
@@ -420,6 +433,16 @@ if static_driver_path and os.path.exists(static_driver_path):
 else:
     sd_nx = sd_ny = sd_dx = sd_dy = sd_z_origin = sd_centlat = sd_centlon = None
     sd_palm_proj = None
+    if static_driver_path:
+        print(f"  WARNING: static driver not found: {static_driver_path}")
+        _sd_dir = os.path.dirname(static_driver_path)
+        if os.path.isdir(_sd_dir):
+            _sd_candidates = sorted(f for f in os.listdir(_sd_dir) if "static" in f)
+            if _sd_candidates:
+                print(f"    static driver(s) available in {_sd_dir}:")
+                for _cand in _sd_candidates:
+                    print(f"      {_cand}")
+        print("    Falling back to the manual [domain] values from the config file")
 
 # Domain parameters (config values override static driver)
 palm_proj_code = ast.literal_eval(config.get("domain", "palm_proj"))[0] if config.has_option("domain", "palm_proj") and config.get("domain", "palm_proj").strip() else (sd_palm_proj or "")
@@ -435,6 +458,28 @@ z_origin = ast.literal_eval(config.get("domain", "z_origin"))[0] if config.has_o
 
 print(f"Domain: nx={nx}, ny={ny}, nz={nz}, dx={dx}, dy={dy}, dz={dz}")
 print(f"Center: lat={centlat}, lon={centlon}")
+
+# Every one of these must come from the static driver or from the config.
+# Without this check a missing/unreadable static driver silently leaves them
+# None and the script dies much later with a cryptic error.
+_missing_domain = [name for name, value in (("nx", nx), ("ny", ny), ("dx", dx),
+                                            ("dy", dy), ("centlat", centlat),
+                                            ("centlon", centlon),
+                                            ("z_origin", z_origin))
+                   if value is None]
+if not palm_proj_code:
+    _missing_domain.append("palm_proj")
+if _missing_domain:
+    _sd_missing = (static_driver_path and not os.path.exists(static_driver_path))
+    raise SystemExit(
+        "Incomplete domain configuration - missing: " + ", ".join(_missing_domain) + ".\n"
+        f"  static_driver_path = {static_driver_path}"
+        + ("   <-- file does not exist\n" if _sd_missing else "\n")
+        + "  Fix: point static_driver_path at an existing PALM static driver, or\n"
+          "       uncomment the manual [domain] overrides (nx, ny, dx, dy, centlat,\n"
+          "       centlon, z_origin) in the config file. Stopping..."
+    )
+
 print(f"z_origin={z_origin:.1f}m, projection={palm_proj_code}")
 
 # Create coordinate arrays (float32)
@@ -482,14 +527,84 @@ end_day = ast.literal_eval(config.get("wrf", "end_day"))[0]
 end_hour = ast.literal_eval(config.get("wrf", "end_hour"))[0]
 dynamic_ts = ast.literal_eval(config.get("wrf", "dynamic_ts"))[0]
 
+# Simulation window - needed below to open only the
+# WRF files that actually cover this period.
+dt_start = datetime(start_year, start_month, start_day, start_hour)
+dt_end = datetime(end_year, end_month, end_day, end_hour)
+
 #===============================================================================
 # Read WRF Files
 #===============================================================================
 print("Reading WRF files...")
 if len(wrf_file) == 1:
-    wrf_files = sorted(glob(wrf_path + wrf_file[0]))
+    wrf_files_matched = sorted(glob(wrf_path + wrf_file[0]))
 else:
-    wrf_files = sorted([wrf_path + file for file in wrf_file])
+    wrf_files_matched = sorted([wrf_path + file for file in wrf_file])
+
+# ---- Keep only the files that cover the requested period --------------------
+_WRF_NAME_RE = re.compile(
+    r"wrfout_(?P<dom>[A-Za-z0-9]+)_"
+    r"(?P<Y>\d{4})-(?P<M>\d{2})-(?P<D>\d{2})[_T]"
+    r"(?P<h>\d{2})[:_](?P<m>\d{2})[:_](?P<s>\d{2})"
+)
+
+
+def _wrf_file_stamp(path):
+    """Return (validity time, domain) parsed from a WRF output file name.
+
+    Returns ``(None, None)`` when the name does not follow the WRF convention
+    ``wrfout_<domain>_<YYYY>-<MM>-<DD>_<HH>:<MM>:<SS>``.
+    """
+    match = _WRF_NAME_RE.search(os.path.basename(path))
+    if match is None:
+        return None, None
+    try:
+        stamp = datetime(int(match["Y"]), int(match["M"]), int(match["D"]),
+                         int(match["h"]), int(match["m"]), int(match["s"]))
+    except ValueError:
+        return None, None
+    return stamp, match["dom"]
+
+
+_parsed_files = [(f, _wrf_file_stamp(f)) for f in wrf_files_matched]
+_parsed_files = [(f, t, dom) for f, (t, dom) in _parsed_files if t is not None]
+
+if _parsed_files:
+    # A broad pattern can also match several WRF domains (d01/d02/...) which
+    # cannot be concatenated into a single dataset - keep the most frequent one.
+    _dom_counts = Counter(dom for _, _, dom in _parsed_files)
+    _keep_dom = _dom_counts.most_common(1)[0][0]
+    if len(_dom_counts) > 1:
+        print(f"  WARNING: pattern matched several WRF domains {dict(_dom_counts)}; "
+              f"keeping '{_keep_dom}'")
+
+    _available = [t for _, t, dom in _parsed_files if dom == _keep_dom]
+    wrf_files = sorted(f for f, t, dom in _parsed_files
+                       if dom == _keep_dom and dt_start <= t <= dt_end)
+
+    if wrf_files:
+        print(f"  {len(wrf_files_matched)} file(s) matched the pattern, "
+              f"{len(wrf_files)} used for {dt_start:%Y-%m-%d %H:%M} to "
+              f"{dt_end:%Y-%m-%d %H:%M} UTC "
+              f"({len(wrf_files_matched) - len(wrf_files)} skipped)")
+        if min(_available) > dt_start:
+            print(f"  WARNING: first available file is {min(_available):%Y-%m-%d %H:%M} "
+                  f"but the run starts at {dt_start:%Y-%m-%d %H:%M} UTC")
+        if max(_available) < dt_end:
+            print(f"  WARNING: last available file is {max(_available):%Y-%m-%d %H:%M} "
+                  f"but the run ends at {dt_end:%Y-%m-%d %H:%M} UTC")
+    else:
+        print(f"  WARNING: no file covers {dt_start:%Y-%m-%d %H:%M} to "
+              f"{dt_end:%Y-%m-%d %H:%M} UTC; opening all "
+              f"{len(wrf_files_matched)} matched file(s)")
+        wrf_files = wrf_files_matched
+else:
+    print(f"  No WRF timestamp found in the file names; opening all "
+          f"{len(wrf_files_matched)} matched file(s)")
+    wrf_files = wrf_files_matched
+
+if not wrf_files:
+    raise SystemExit(f"No WRF files found for pattern '{wrf_path}{wrf_file}'. Stopping...")
 
 ds_wrf = xr.Dataset()
 with salem.open_mf_wrf_dataset(wrf_files) as ds_raw:
@@ -509,9 +624,6 @@ print(f"ALT (inverse density) loaded. Shape: {alt_wrf.shape}")
 #===============================================================================
 # Find Timestamps
 #===============================================================================
-dt_start = datetime(start_year, start_month, start_day, start_hour)
-dt_end = datetime(end_year, end_month, end_day, end_hour)
-
 wrf_ts = (ds_wrf["time"][1] - ds_wrf["time"][0]).data.astype("float64") * 1e-9
 
 if dynamic_ts < wrf_ts:
@@ -685,7 +797,7 @@ surface_var_dict = {"U": u10_wrf, "V": v10_wrf, "pt": pt2_wrf, "QVAPOR": qv2_wrf
 # Full 3D Vertical Interpolation for init_atmosphere (LOD=2)
 # Interpolates FULL horizontal domain to PALM z-levels at t=0 only.
 # Used for init_atmosphere_* with dims (z, y, x) / (z, y, xu) / (z, yv, x) / (zw, y, x)
-# NOTE: skipped for SALSA/aerosol runs - PALM requires LOD=1 (1D) met init there.
+# skipped for SALSA/aerosol runs - PALM requires LOD=1 (1D) met init there.
 #===============================================================================
 use_3d_init = write_init_3d and not aerosol_wrfchem
 if use_3d_init:
@@ -753,10 +865,8 @@ if use_3d_init:
     
     # Chemistry is NOT interpolated to 3D here: PALM only accepts chemistry
     # init_atmosphere_* as LOD=1 (1D profiles), so chemistry init is handled
-    # separately from chem_init below. Skipping saves ~1 min of computation.
     print(f"  Chemistry: 1D profiles only (LOD=1, PALM requirement; {len(all_chem_to_process)} species)")
     
-    # Cap init 3D qv at 99.9% RH
     if 'QVAPOR' in init_3d_vars and 'PRESSURE' in init_3d_vars and 'pt' in init_3d_vars:
         temp_3d = init_3d_vars['pt'] * (init_3d_vars['PRESSURE'] / p0_ref) ** (Rd_gas / cp_gas)
         init_3d_vars['QVAPOR'] = cap_qvapor_at_rh(init_3d_vars['QVAPOR'], temp_3d, init_3d_vars['PRESSURE'], rh_max=0.999)
@@ -926,8 +1036,6 @@ for varbc in met_vars:
     gc.collect()
 
 # ===== Cap relative humidity at 99.9% in boundary conditions =====
-# WRF numerical advection can produce supersaturated qv (>100% RH).
-# This cap removes those artifacts while preserving realistic moisture.
 print("Capping boundary QVAPOR at 99.9% RH...")
 
 # Convert pt to T: T = pt * (p / p0)^(Rd/cp)
@@ -1064,12 +1172,12 @@ if "OCNV" in chem_species:
     del ocnv_we, ocnv_sn
     gc.collect()
 
-# ===== MODIFICATION 1: Traffic variables set to ZERO (not copied) =====
+# ===== Traffic variables set to ZERO =====
 if has_traffic_vars:
     print("Setting up traffic variables with ZERO initial/boundary conditions...")
     for base_species, traffic_species in traffic_mapping.items():
         if base_species in ds_palm_we.data_vars:
-            # Set to ZERO instead of copying from base species
+            # Set to ZERO 
             zeros_we_tra = np.zeros((len(all_ts), len(z), len(y), len(x[:2])), dtype=np.float32)
             zeros_sn_tra = np.zeros((len(all_ts), len(z), len(y[:2]), len(x)), dtype=np.float32)
             ds_palm_we[traffic_species] = xr.DataArray(zeros_we_tra, dims=['time', 'z', 'y', 'x'])
@@ -1092,8 +1200,7 @@ for species in list(ds_palm_we.data_vars):
             ds_palm_sn[species] = ds_palm_sn[species].ffill('z').bfill('z').fillna(0)
 
 #===============================================================================
-# Top Boundary — CORRECTLY extracted from PALM domain top after vertical interpolation
-# FIX: Previously used WRF model top (bottom_top=-1). Now uses PALM's top z-level.
+# Top Boundary — extracted from PALM domain top after vertical interpolation.
 #===============================================================================
 print("\nProcessing top boundary conditions...")
 print("  NOTE: Using PALM domain top z-level (not WRF model top)")
@@ -1189,10 +1296,10 @@ if "OCNV" in chem_species:
         if comp in chem_top:
             chem_top["OCNV"] += chem_top[comp]
 
-# ===== MODIFICATION 1 (continued): Traffic species top boundary set to ZERO =====
+# ===== Traffic species top boundary set to ZERO =====
 if has_traffic_vars:
     for base_species, traffic_species in traffic_mapping.items():
-        # Set traffic species to ZERO (not copied from base)
+        # Set traffic species to ZERO 
         chem_top[traffic_species] = np.zeros((len(all_ts), len(y), len(x)), dtype=np.float32)
         print(f"  ZEROED top: {traffic_species}")
 
@@ -1256,6 +1363,40 @@ else:
 #===============================================================================
 # Surface NaNs
 #===============================================================================
+def _open_fd_count():
+    """Number of file descriptors currently open by this process (-1 if unknown)."""
+    try:
+        return len(os.listdir('/proc/self/fd'))
+    except OSError:
+        return -1
+
+
+def _fd_limited_pool_size(requested, fd_per_worker=2, reserve=32):
+    """Clamp a Pool size to what the remaining file-descriptor budget allows.
+
+    The fork-based Pool needs about two descriptors per worker, every opened
+    netCDF file keeps its descriptor for the whole run, and the per-process
+    limit is often only 1024 (and not always raisable). Asking for more workers
+    than the budget allows fails while the pool is being created with
+    "OSError: [Errno 24] Too many open files".
+    """
+    try:
+        import resource
+        soft_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (ImportError, ValueError, OSError):
+        return requested
+    used = _open_fd_count()
+    if soft_limit <= 0 or used < 0:
+        return requested
+    affordable = max(1, (soft_limit - used - reserve) // fd_per_worker)
+    if affordable < requested:
+        print(f"  NOTE: descriptor limit {soft_limit}, {used} already open -> "
+              f"max_pool reduced from {requested} to {affordable}")
+    return min(requested, affordable)
+
+
+max_pool = _fd_limited_pool_size(max_pool)
+
 print("Resolving surface NaNs...")
 with Pool(max_pool) as p:
     pool_outputs = list(
@@ -1303,11 +1444,46 @@ v10_mean = v10_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).dat
 qv2_mean = qv2_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
 pt2_mean = pt2_wrf.sel(time=dt_start).mean(dim=["south_north", "west_east"]).data
 
-u_init = surface_nan_uv(u_init.data, z, u10_mean)
-v_init = surface_nan_uv(v_init.data, z, v10_mean)
-w_init = surface_nan_w(w_init.data)
-qv_init = surface_nan_s(qv_init.data, z, qv2_mean)
-pt_init = surface_nan_s(pt_init.data, z, pt2_mean)
+def _fill_and_check(profile, filler, *args, name=""):
+    """Fill NaNs below the lowest WRF level, then verify the result is finite.
+
+    Background: PALM's lowest scalar level sits at z_origin + dz/2 (here 4 m
+    AGL) which is BELOW the lowest WRF-Chem scalar level (~23 m AGL for this
+    32-level grid).  Vertical interpolation with method='linear' therefore
+    returns NaN for the lowest PALM levels; surface_nan_s/uv/w extend the
+    lowest valid value downwards UNCHANGED.  That is the same treatment
+    salem's wrf_zlevel() applies to the lateral boundary data (ls_forcing_*),
+    so the 1-D initial profile and the boundaries stay mutually consistent.
+
+    Every filled value is still a genuine WRF-Chem value taken from the lowest
+    level that WRF actually resolves - nothing is extrapolated or invented.
+    """
+    arr = np.asarray(profile, dtype=np.float32)
+    nan_idx = np.nonzero(np.isnan(arr))[0]
+    out = np.asarray(filler(arr, *args), dtype=np.float32)
+    n_left = int(np.isnan(out).sum())
+    if nan_idx.size:
+        first_valid = int(nan_idx.max()) + 1
+        print(f"    {name:<3} : filled level(s) {nan_idx.min()}..{nan_idx.max()} "
+              f"(z = {z[nan_idx.min()]:.0f}..{z[nan_idx.max()]:.0f} m ASL or "
+              f"{z[nan_idx.min()]-z_origin:.0f}..{z[nan_idx.max()]-z_origin:.0f} m AGL) "
+              f"with the value at level {first_valid} "
+              f"(z = {z[first_valid]:.0f} m ASL) = {out[first_valid]:.6g}")
+    if n_left:
+        raise ValueError(
+            f"init_atmosphere_{name} still contains {n_left} NaN value(s) after "
+            f"filling - the WRF-Chem column does not reach down far enough to "
+            f"supply these levels. Cannot continue with NaN in the driver. "
+            f"Either extend the WRF input, or reduce nz/dz so that every PALM "
+            f"level lies above the lowest WRF level.")
+    return out
+
+
+u_init = _fill_and_check(u_init.data, surface_nan_uv, z, u10_mean, name="u")
+v_init = _fill_and_check(v_init.data, surface_nan_uv, z, v10_mean, name="v")
+w_init = _fill_and_check(w_init.data, surface_nan_w, name="w")
+qv_init = _fill_and_check(qv_init.data, surface_nan_s, z, qv2_mean, name="qv")
+pt_init = _fill_and_check(pt_init.data, surface_nan_s, z, pt2_mean, name="pt")
 
 # Initialize chemistry profiles
 chem_init = {}
@@ -1367,10 +1543,10 @@ if "OCNV" in chem_species:
             ocnv_init += chem_init[comp].values
     chem_init["OCNV"] = xr.DataArray(ocnv_init, dims=['z'], coords={'z': z})
 
-# ===== MODIFICATION 1 (continued): Traffic species initial profiles set to ZERO =====
+# ===== Traffic species initial profiles set to ZERO =====
 if has_traffic_vars:
     for base_species, traffic_species in traffic_mapping.items():
-        # Set traffic species initial to ZERO (not copied from base)
+        # Set traffic species initial to ZERO 
         chem_init[traffic_species] = xr.DataArray(np.zeros(len(z), dtype=np.float32), dims=['z'], coords={'z': z})
         print(f"  ZEROED init: {traffic_species}")
 
@@ -1421,9 +1597,7 @@ if aerosol_wrfchem:
     print("STEP 1: Calculating aerosol initial profiles (with unit conversion)...")
     print("-"*40)
     
-    # FIX (Bug 1): level-local air density on the PALM z grid (ideal gas law).
-    # The old code used the full-column mean of WRF ALT (~0.36 kg/m3) for every
-    # level, which under-converts #/kg -> #/m3 by ~3x near the surface.
+    #  level-local air density on the PALM z grid (ideal gas law).
     temp_init_K = pt_init * (p_init / p0_ref) ** (Rd_gas / cp_gas)
     rho_init = p_init / (Rd_gas * temp_init_K * (1.0 + 0.61 * qv_init))   # (nz,) kg/m3
     rho_init = np.clip(np.nan_to_num(rho_init, nan=1.2, posinf=1.2, neginf=1.2), 0.2, 3.0)
@@ -1482,7 +1656,7 @@ if aerosol_wrfchem:
         mass_fracs_orig, listspec, nf2a
     )
     
-    # ===== MODIFICATION 2: Enforce exact sum to 1 for initial mass fractions =====
+    # ===== Enforce exact sum to 1 for initial mass fractions =====
     #mass_fracs_a_init = enforce_exact_sum_to_one(mass_fracs_a_init, axis=-1)
     #if nf2a < 1.0:
     #    mass_fracs_b_init = enforce_exact_sum_to_one(mass_fracs_b_init, axis=-1)
@@ -1509,12 +1683,12 @@ if aerosol_wrfchem:
     else:
         aerosol_concentration_init = aerosol_conc_10bin
     
-    # FIX (Bug 2): rescale the per-bin numbers so the implied SALSA mass equals
+    # rescale the per-bin numbers so the implied SALSA mass equals
     # the WRF-Chem mass fields (WRF num_a0X overpredict mass and the number-
-    # overlap mapping inflates it via the D^3 volume term).  Size-dist. shape kept.
+    # overlap mapping inflates it via the D^3 volume term).
     aerosol_concentration_init, _scale_init = rescale_number_to_target_mass(
         aerosol_concentration_init, dmid_all, mass_matrix, listspec)
-    print(f"    [Bug2 fix] init numbers rescaled by mean factor {np.nanmean(_scale_init):.3f} "
+    print(f"    [WRFChem] init numbers rescaled by mean factor {np.nanmean(_scale_init):.3f} "
           f"-> implied mass = WRF mass fields "
           f"({np.nanmean(np.sum(mass_matrix, axis=-1)) * 1e9:.2f} ug/m3 at surface)")
     
@@ -1571,8 +1745,6 @@ if aerosol_wrfchem:
     
     # ----- West/East Boundaries -----
     print("  Processing West/East boundaries...")
-    # FIX (Bug 1): level-local air density from boundary met fields (PALM z grid),
-    # replaces the old full-column-mean WRF ALT (which was ~3x too low near surface).
     pres_we = ds_palm_we['PRESSURE'].values
     temp_we = ds_palm_we['pt'].values * (pres_we / p0_ref) ** (Rd_gas / cp_gas)
     rho_we = pres_we / (Rd_gas * temp_we * (1.0 + 0.61 * ds_palm_we['QVAPOR'].values))
@@ -1635,7 +1807,6 @@ if aerosol_wrfchem:
                         left_mass_orig[ts, zlev, :, idx] = pm25_left * frac_left
                         right_mass_orig[ts, zlev, :, idx] = pm25_right * frac_right
             
-            # FIX (Bug 2): boundary SALSA mass = WRF-Chem mass fields
             left_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
                 left_aerosol[ts, zlev, :, :], dmid_all, left_mass_orig[ts, zlev, :, :], listspec)[0]
             right_aerosol[ts, zlev, :, :] = rescale_number_to_target_mass(
@@ -1643,7 +1814,7 @@ if aerosol_wrfchem:
     
     # ----- South/North Boundaries -----
     print("  Processing South/North boundaries...")
-    # FIX (Bug 1): level-local air density from boundary met fields (PALM z grid)
+    # level-local air density from boundary met fields (PALM z grid)
     pres_sn = ds_palm_sn['PRESSURE'].values
     temp_sn = ds_palm_sn['pt'].values * (pres_sn / p0_ref) ** (Rd_gas / cp_gas)
     rho_sn = pres_sn / (Rd_gas * temp_sn * (1.0 + 0.61 * ds_palm_sn['QVAPOR'].values))
@@ -1718,7 +1889,7 @@ if aerosol_wrfchem:
         current_time = all_ts[ts]
         wrf_time_idx = np.argmin(np.abs(ds_wrf.time.values - current_time))
         
-        # FIX (Bug 1): air density at the PALM top level (mean over boundary columns)
+        # air density at the PALM top level (mean over boundary columns)
         rho_top = float(np.nanmean(rho_we[ts, -1, :, :]))
         if not np.isfinite(rho_top) or rho_top <= 0.0:
             rho_top = 1.0
@@ -1759,7 +1930,7 @@ if aerosol_wrfchem:
                     frac_top = get_trace_metal_mass_fraction(spec, street_type_surface)
                     top_mass_orig[ts, :, :, idx] = pm25_top * frac_top
         
-        # FIX (Bug 2): top-boundary SALSA mass = WRF-Chem mass fields
+        # top-boundary SALSA mass = WRF-Chem mass fields
         top_aerosol[ts, :, :, :] = rescale_number_to_target_mass(
             top_aerosol[ts, :, :, :], dmid_all, top_mass_orig[ts, :, :, :], listspec)[0]
     
@@ -1943,7 +2114,7 @@ nc_output['init_soil_t'] = xr.DataArray(init_tsoil.astype(np.float32), dims=['zs
     attrs={'units': 'K', 'source': 'WRF', 'long_name': 'soil temperature', 'lod': np.int32(2)})
 
 # ===== MASS BALANCING (U, V, W boundaries) =====
-# From PALM meteo builtin.py: preserves mass continuity across all boundaries
+# Based in PALM meteo tool builtin.py: preserves mass continuity across all boundaries
 # Adjusts U(left/right), V(south/north), W(top) by a uniform correction velocity
 if enable_mass_balance:
     print("\n" + "="*60)
@@ -2015,10 +2186,7 @@ if enable_mass_balance:
     print("="*60)
 
 # Meteorological variables
-# Use 3D init (LOD=2) only if no SALSA: with LOD=2, PALM leaves pt zero at
-# ghost/boundary grid points, which crashes SALSA's thermodynamic init
-# (ideal_gas_law_rho divide-by-zero). SALSA runs must use LOD=1 (1D profiles),
-# as produced by PALM's INIFOR tool.
+# Use 3D init (LOD=2) only if no SALSA: with LOD=2, 
 use_3d_met_init = (write_init_3d and 'init_3d_vars' in dir()
                    and len(init_3d_vars) > 0 and not aerosol_wrfchem)
 if use_3d_met_init:
@@ -2105,10 +2273,6 @@ for species in original_chem_species:
     else:
         output_name = chem_name_mapping.get(species, species.upper())
     
-    # PALM requires chemistry init_atmosphere_* variables to be LOD=1 (1D
-    # profiles). LOD=2 (3D volume data) is only allowed for the meteorological
-    # variables (pt, qv, u, v, w), not for chemistry. Writing lod=2 chemistry
-    # triggers PALM error DRV0007.
     if species in chem_init:
         if species in ['PM10', 'PM2_5_DRY'] or species.replace('_tra', '') in ['PM10', 'PM2_5_DRY']:
             init_data = chem_init[species].data * MICROGRAM_TO_KG

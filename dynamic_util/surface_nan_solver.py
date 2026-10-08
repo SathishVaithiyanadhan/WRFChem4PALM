@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 WRF4PALM - Vectorized surface NaN solver
+========================================
 """
 import numpy as np
 
@@ -25,17 +26,15 @@ def surface_nan_uv_vectorized(data, z, uv10):
             # Still in NaN region - use log profile
             valid_idx = np.min(first_valid)
             if valid_idx < len(z):
-                terrain_height = z[valid_idx]
-                a = (data[valid_idx] - uv10) / np.log(terrain_height / (terrain_height + 10))
-                b = uv10 - a * np.log(10 + terrain_height)
-                result[idx] = a * np.log(z[idx]) + b
+
+                result[idx] = data[valid_idx]
     
     return result
 
 def surface_nan_s_vectorized(data, z, s2):
     """
     Vectorized surface NaN resolution for scalars
-    Linear interpolation from surface
+    Constant extension of the lowest valid level (see module docstring)
     """
     nan_mask = np.isnan(data)
     if not np.any(nan_mask):
@@ -48,11 +47,8 @@ def surface_nan_s_vectorized(data, z, s2):
         if idx < np.min(first_valid):
             valid_idx = np.min(first_valid)
             if valid_idx < len(z):
-                terrain_height = z[valid_idx]
-                a = (s2 - data[valid_idx]) / 2.0
-                b = s2 - a * (2 + terrain_height)
-                result[idx] = a * z[idx] + b
-    
+
+                result[idx] = data[valid_idx]
     return result
 
 def surface_nan_w_vectorized(data):
@@ -68,7 +64,7 @@ def surface_nan_w_vectorized(data):
     
     for idx in range(data.shape[0]):
         if idx < np.min(first_valid):
-            valid_idx = np.min(first_valid) + 1
+            valid_idx = np.min(first_valid)
             if valid_idx < len(data):
                 result[idx] = data[valid_idx]
     
